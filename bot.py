@@ -1,8 +1,6 @@
 # drednot_bot.py
 # Final version, optimized for Render/Docker.
-# THIS VERSION HAS BEEN MODIFIED to include the "Sort the Chat" minigame.
-# The external server communication for commands has been removed in favor of this self-contained game.
-# CORRECTED: Fixed the "SyntaxError: name is used prior to global declaration" bug.
+# THIS VERSION INCLUDES THE ROBUST STARTUP FIX to ensure the bot always listens for commands.
 
 import os
 import queue
@@ -100,14 +98,11 @@ command_executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS, thread_nam
 atexit.register(lambda: command_executor.shutdown(wait=True))
 
 # =========================================================================
-# === SORT THE CHAT - GAME LOGIC (PORTED FROM USERSCRIPT) ===
+# === SORT THE CHAT - GAME LOGIC (Unchanged) ===
 # =========================================================================
-
 GAME_STATE = {}
 EVENT_DECK = []
 game_lock = Lock()
-
-# --- GAME DATA (EVENTS) ---
 EVENTS = [
     { "petitioner": "A Farmer", "text": "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds or we'll starve.", "onYes": {"text": "The farmers are grateful! They begin replanting with the funds you provided.", "effects": {"treasury": -50, "happiness": 15, "population": 5}}, "onNo":  {"text": "The farmers despair. The blight spreads, and the harvest is meager.", "effects": {"happiness": -15, "population": -10}}},
     { "petitioner": "The Royal Architect", "text": "Your majesty, for 75 gold, I can build a grand aqueduct, improving sanitation and bringing fresh water to the city!", "onYes": {"text": "Construction begins! The aqueduct is a marvel of engineering, a symbol of your benevolent rule.", "effects": {"treasury": -75}, "modifier": {"source": "Aqueduct", "duration": 10, "effects": {"happiness": 2, "population": 1}}}, "onNo":  {"text": "The people grumble about the dusty streets and murky well water.", "effects": {"happiness": -5}}},
@@ -118,140 +113,72 @@ EVENTS = [
     { "petitioner": "An Alchemist", "text": "Your eminence! My research into turning lead into gold is nearly complete. I require a 60 gold grant to finish my magnum opus!", "onYes": [ {"chance": 5, "text": "He did it! The madman actually did it! He hands you a lump of pure gold worth 200 gold before mysteriously vanishing.", "effects": {"treasury": 140, "happiness": 10}}, {"chance": 25, "text": "The experiment resulted in a powerful new fertilizer. The fields will be extra bountiful next season.", "effects": {"treasury": -60, "population": 15, "happiness": 5}}, {"chance": 70, "text": "A small explosion rocks the lab. The alchemist sheepishly reports that he has failed, and your gold is gone.", "effects": {"treasury": -60, "happiness": -5}}], "onNo":  {"text": "You dismiss the alchemist as a charlatan. He leaves the city, dejected.", "effects": {}}},
 ]
 
-# --- GAME HELPER FUNCTIONS ---
 def format_effects(effects):
-    parts = []
-    symbols = {"treasury": '💰', "happiness": '😊', "population": '👨‍👩‍👧‍👦'}
-    for stat, value in effects.items():
-        sign = '+' if value > 0 else ''
-        parts.append(f"{sign}{value} {symbols.get(stat, stat)}")
+    parts = []; symbols = {"treasury": '💰', "happiness": '😊', "population": '👨‍👩‍👧‍👦'}
+    for stat, value in effects.items(): parts.append(f"{'+' if value > 0 else ''}{value} {symbols.get(stat, stat)}")
     return ", ".join(parts)
-
 def shuffle_event_deck():
-    global EVENT_DECK
-    logging.info("Shuffling the event deck...")
-    EVENT_DECK = EVENTS[:]
-    random.shuffle(EVENT_DECK)
-
-# --- CORE GAME FUNCTIONS (CORRECTED) ---
+    global EVENT_DECK; logging.info("Shuffling the event deck..."); EVENT_DECK = EVENTS[:]; random.shuffle(EVENT_DECK)
 def start_game(username):
-    global GAME_STATE  # MOVED: global declaration must be at the top of the function.
+    global GAME_STATE
     with game_lock:
-        if GAME_STATE.get("gameActive"):
-            queue_reply("A game is already in progress. Use !endgame to stop it.")
-            return
-
-        GAME_STATE = {
-            "day": 0, "treasury": 100, "happiness": 50, "population": 100,
-            "gameActive": True, "isAwaitingDecision": False, "currentEvent": None, "modifiers": [],
-        }
+        if GAME_STATE.get("gameActive"): queue_reply("A game is already in progress. Use !endgame to stop it."); return
+        GAME_STATE = {"day": 0, "treasury": 100, "happiness": 50, "population": 100, "gameActive": True, "isAwaitingDecision": False, "currentEvent": None, "modifiers": []}
         log_event(f"GAME: New game started by {username}.")
-        queue_reply(["A new reign begins! Rule your kingdom with wisdom.", "Commands: !yes, !no, !status, !help, !endgame"])
-        shuffle_event_deck()
-    
+        queue_reply(["A new reign begins! Rule your kingdom with wisdom.", "Commands: !yes, !no, !status, !help, !endgame"]); shuffle_event_deck()
     command_executor.submit(lambda: (time.sleep(MESSAGE_DELAY_SECONDS * 2), next_event()))
-
 def end_game(reason, username):
-    global GAME_STATE # ADDED: For clarity and consistency.
+    global GAME_STATE
     with game_lock:
         if not GAME_STATE.get("gameActive"): return
         log_event(f"GAME: Game ended by {username}. Reason: {reason}")
-        queue_reply([
-            f"--- Your reign has ended after {GAME_STATE.get('day', 0)} days. ---",
-            f"Reason: {reason}",
-            f"Final Stats: {GAME_STATE.get('treasury', 0)} gold, {GAME_STATE.get('happiness', 0)} happiness, {GAME_STATE.get('population', 0)} people.",
-            "Type !startgame to play again."
-        ])
-        GAME_STATE["gameActive"] = False
-        GAME_STATE["isAwaitingDecision"] = False
-
+        queue_reply([f"--- Your reign has ended after {GAME_STATE.get('day', 0)} days. ---", f"Reason: {reason}", f"Final Stats: {GAME_STATE.get('treasury', 0)} gold, {GAME_STATE.get('happiness', 0)} happiness, {GAME_STATE.get('population', 0)} people.", "Type !startgame to play again."])
+        GAME_STATE["gameActive"] = False; GAME_STATE["isAwaitingDecision"] = False
 def next_event():
-    global GAME_STATE # ADDED: For clarity and consistency.
+    global GAME_STATE
     with game_lock:
         if not GAME_STATE.get("gameActive"): return
-        
-        # Apply daily modifiers
-        modifier_log = []
-        expired_modifiers = []
+        modifier_log = []; expired_modifiers = []
         for mod in GAME_STATE.get("modifiers", []):
             for stat, effect in mod["effects"].items(): GAME_STATE[stat] += effect
-            mod["duration"] -= 1
-            modifier_log.append(f"{format_effects(mod['effects'])} from {mod['source']}")
+            mod["duration"] -= 1; modifier_log.append(f"{format_effects(mod['effects'])} from {mod['source']}")
             if mod["duration"] <= 0: expired_modifiers.append(mod)
-
         GAME_STATE["modifiers"] = [mod for mod in GAME_STATE["modifiers"] if mod not in expired_modifiers]
         if modifier_log: queue_reply(f"Daily upkeep: {', '.join(modifier_log)}")
-
-        # Check for game over conditions
         if GAME_STATE.get("treasury", 0) < 0: end_game("The kingdom is bankrupt!", "System"); return
         if GAME_STATE.get("happiness", 0) <= 0: end_game("The people have revolted due to unhappiness!", "System"); return
         if GAME_STATE.get("population", 0) <= 0: end_game("The kingdom has become a ghost town.", "System"); return
-            
-        GAME_STATE["day"] += 1
-
+        GAME_STATE["day"] += 1;
         if not EVENT_DECK: shuffle_event_deck()
-        GAME_STATE["currentEvent"] = EVENT_DECK.pop()
-        GAME_STATE["isAwaitingDecision"] = True
+        GAME_STATE["currentEvent"] = EVENT_DECK.pop(); GAME_STATE["isAwaitingDecision"] = True
         event = GAME_STATE["currentEvent"]
-        queue_reply([
-            f"--- Day {GAME_STATE['day']} ---", f"{event['petitioner']} approaches the throne.",
-            f"\"{event['text']}\"", "How do you respond? (!yes / !no)"
-        ])
-
+        queue_reply([f"--- Day {GAME_STATE['day']} ---", f"{event['petitioner']} approaches the throne.", f"\"{event['text']}\"", "How do you respond? (!yes / !no)"])
 def handle_decision(choice, username):
-    global GAME_STATE # ADDED: For clarity and consistency.
+    global GAME_STATE
     with game_lock:
         if not GAME_STATE.get("gameActive") or not GAME_STATE.get("isAwaitingDecision"): return
-        
-        log_event(f"GAME: {username} chose '{choice}'.")
-        GAME_STATE["isAwaitingDecision"] = False
-        event = GAME_STATE["currentEvent"]
-        decision_key = 'onYes' if choice == '!yes' else 'onNo'
-        outcomes = event[decision_key]
-
+        log_event(f"GAME: {username} chose '{choice}'."); GAME_STATE["isAwaitingDecision"] = False
+        event = GAME_STATE["currentEvent"]; decision_key = 'onYes' if choice == '!yes' else 'onNo'; outcomes = event[decision_key]
         if not isinstance(outcomes, list): outcomes = [outcomes]
-        
-        total_chance = sum(o.get("chance", 100) for o in outcomes)
-        roll = random.uniform(0, total_chance)
+        total_chance = sum(o.get("chance", 100) for o in outcomes); roll = random.uniform(0, total_chance)
         chosen_outcome = next((o for o in outcomes if (roll := roll - o.get("chance", 100)) < 0), outcomes[-1])
-        
         if "effects" in chosen_outcome:
             for stat, value in chosen_outcome["effects"].items(): GAME_STATE[stat] += value
-        if "modifier" in chosen_outcome:
-            GAME_STATE["modifiers"].append(dict(chosen_outcome["modifier"]))
-
-        effects_str = format_effects(chosen_outcome.get("effects", {}))
-        feedback = f"{chosen_outcome['text']} ({effects_str})" if effects_str else chosen_outcome['text']
+        if "modifier" in chosen_outcome: GAME_STATE["modifiers"].append(dict(chosen_outcome["modifier"]))
+        effects_str = format_effects(chosen_outcome.get("effects", {})); feedback = f"{chosen_outcome['text']} ({effects_str})" if effects_str else chosen_outcome['text']
         queue_reply(feedback)
-
     command_executor.submit(lambda: (time.sleep(MESSAGE_DELAY_SECONDS * 4), next_event()))
-
 def show_status(username):
-    global GAME_STATE # ADDED: For clarity and consistency.
+    global GAME_STATE
     with game_lock:
-        if not GAME_STATE.get("gameActive"):
-            queue_reply("There is no active game. Type !startgame to begin.")
-            return
-        
-        lines = [
-            f"--- Kingdom Status (Day {GAME_STATE['day']}) ---",
-            f"💰 Treasury: {GAME_STATE['treasury']}", f"😊 Happiness: {GAME_STATE['happiness']}",
-            f"👨‍👩‍👧‍👦 Population: {GAME_STATE['population']}"
-        ]
+        if not GAME_STATE.get("gameActive"): queue_reply("There is no active game. Type !startgame to begin."); return
+        lines = [f"--- Kingdom Status (Day {GAME_STATE['day']}) ---", f"💰 Treasury: {GAME_STATE['treasury']}", f"😊 Happiness: {GAME_STATE['happiness']}", f"👨‍👩‍👧‍👦 Population: {GAME_STATE['population']}"]
         if GAME_STATE.get("modifiers"):
             lines.append("--- Active Effects ---")
             for mod in GAME_STATE["modifiers"]: lines.append(f"• {mod['source']} ({mod['duration']}d left)")
         queue_reply(lines)
-
 def show_help(username):
-    queue_reply([
-        "--- Sort the Chat Help ---", "This is a kingdom management game where you rule by making decisions.",
-        "Reply with !yes or !no to each petitioner.", "Your decisions affect your Treasury 💰, Happiness 😊, and Population 👨‍👩‍👧‍👦.",
-        "Try to keep your kingdom thriving for as long as possible!", "Commands: !startgame, !endgame, !yes, !no, !status, !help"
-    ])
-
-# =========================================================================
-# === END OF GAME LOGIC SECTION ===
+    queue_reply(["--- Sort the Chat Help ---", "This is a kingdom management game where you rule by making decisions.", "Reply with !yes or !no to each petitioner.", "Your decisions affect your Treasury 💰, Happiness 😊, and Population 👨‍👩‍👧‍👦.", "Try to keep your kingdom thriving for as long as possible!", "Commands: !startgame, !endgame, !yes, !no, !status, !help"])
 # =========================================================================
 
 def log_event(message):
@@ -260,7 +187,6 @@ def log_event(message):
     BOT_STATE["event_log"].appendleft(full_message)
     logging.info(f"EVENT: {message}")
 
-# --- BROWSER & FLASK SETUP ---
 def setup_driver():
     logging.info("Launching headless browser for Docker environment...")
     chrome_options = Options()
@@ -276,16 +202,7 @@ def setup_driver():
 flask_app = Flask('')
 @flask_app.route('/')
 def health_check():
-    html = f"""
-    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
-    <title>Drednot Bot Status</title><style>body{{font-family:'Courier New',monospace;background-color:#1e1e1e;color:#d4d4d4;padding:20px;}}.container{{max-width:800px;margin:auto;background-color:#252526;border:1px solid #373737;padding:20px;border-radius:8px;}}h1,h2{{color:#4ec9b0;border-bottom:1px solid #4ec9b0;padding-bottom:5px;}}p{{line-height:1.6;}}.status-ok{{color:#73c991;font-weight:bold;}}.label{{color:#9cdcfe;font-weight:bold;}}ul{{list-style-type:none;padding-left:0;}}li{{background-color:#2d2d2d;margin-bottom:8px;padding:10px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}}</style></head>
-    <body><div class="container"><h1>Drednot Bot Status (Game Edition)</h1>
-    <p><span class="label">Status:</span><span class="status-ok">{BOT_STATE['status']}</span></p>
-    <p><span class="label">Current Ship ID:</span>{BOT_STATE['current_ship_id']}</p>
-    <p><span class="label">Last Command:</span>{BOT_STATE['last_command_info']}</p>
-    <p><span class="label">Last Message Sent:</span>{BOT_STATE['last_message_sent']}</p>
-    <h2>Recent Events (Log)</h2><ul>{''.join(f'<li>{event}</li>' for event in BOT_STATE['event_log'])}</ul></div></body></html>
-    """
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10"><title>Drednot Bot Status</title><style>body{{font-family:'Courier New',monospace;background-color:#1e1e1e;color:#d4d4d4;padding:20px;}}.container{{max-width:800px;margin:auto;background-color:#252526;border:1px solid #373737;padding:20px;border-radius:8px;}}h1,h2{{color:#4ec9b0;border-bottom:1px solid #4ec9b0;padding-bottom:5px;}}p{{line-height:1.6;}}.status-ok{{color:#73c991;font-weight:bold;}}.label{{color:#9cdcfe;font-weight:bold;}}ul{{list-style-type:none;padding-left:0;}}li{{background-color:#2d2d2d;margin-bottom:8px;padding:10px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}}</style></head><body><div class="container"><h1>Drednot Bot Status (Game Edition)</h1><p><span class="label">Status:</span><span class="status-ok">{BOT_STATE['status']}</span></p><p><span class="label">Current Ship ID:</span>{BOT_STATE['current_ship_id']}</p><p><span class="label">Last Command:</span>{BOT_STATE['last_command_info']}</p><p><span class="label">Last Message Sent:</span>{BOT_STATE['last_message_sent']}</p><h2>Recent Events (Log)</h2><ul>{''.join(f'<li>{event}</li>' for event in BOT_STATE['event_log'])}</ul></div></body></html>"""
     return Response(html, mimetype='text/html')
 
 def run_flask():
@@ -293,7 +210,6 @@ def run_flask():
     logging.info(f"Health check server listening on http://0.0.0.0:{port}")
     flask_app.run(host='0.0.0.0', port=port)
 
-# --- HELPER & CORE FUNCTIONS ---
 def queue_reply(message):
     MAX_LEN = 199
     lines = message if isinstance(message, list) else [message]
@@ -324,7 +240,6 @@ def message_processor_thread():
         except Exception as e: logging.error(f"Unexpected error in message processor: {e}")
         time.sleep(MESSAGE_DELAY_SECONDS)
 
-# --- BOT MANAGEMENT FUNCTIONS ---
 def reset_inactivity_timer():
     global inactivity_timer
     if inactivity_timer: inactivity_timer.cancel()
@@ -372,9 +287,29 @@ def start_bot(use_key_login):
         except TimeoutException: logging.warning("Login procedure timed out. Assuming already in-game."); log_event("Login timeout; assuming in-game.")
         except Exception as e: log_event(f"Login failed critically: {e}"); raise e
 
-        WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.ID, "chat-input")))
-        if not fetch_command_list(): raise RuntimeError("Initial command load failed.")
+        # <<< START OF UPDATED BLOCK >>>
+        # This is the new, more reliable way to ensure the bot is ready.
+        log_event("Waiting for game UI to be fully ready...")
+        try:
+            # It now waits for three critical UI elements, not just one.
+            wait = WebDriverWait(driver, 60)
+            wait.until(EC.all_of(
+                EC.presence_of_element_located((By.ID, "chat-input")),
+                EC.presence_of_element_located((By.ID, "player-list")),
+                EC.presence_of_element_located((By.ID, "exit_button"))
+            ))
+            log_event("✅ Game UI is ready. The bot can now see and hear.")
+        except TimeoutException:
+            log_event("CRITICAL: Game UI did not load within 60 seconds. The bot cannot continue.")
+            raise RuntimeError("Timed out waiting for the main game interface to load.")
+
+        # Now that we know the page is ready, we can safely set up the command listener.
+        log_event("Setting up the command listener...")
+        if not fetch_command_list():
+            raise RuntimeError("Could not load the internal command list.")
         queue_browser_update()
+        log_event("✅ Command listener is active.")
+        # <<< END OF UPDATED BLOCK >>>
     
     BOT_STATE["status"] = "Running"
     queue_reply("Sort the Chat Bot is online! Type !startgame to begin.")
