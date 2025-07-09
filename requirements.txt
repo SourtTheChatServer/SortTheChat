@@ -1,0 +1,4 @@
+# Python libraries required by the Drednot Bot
+requests~=2.31.0
+Flask~=3.0.0
+selenium~=4.15.0
