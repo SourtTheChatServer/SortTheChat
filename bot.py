@@ -2,6 +2,7 @@
 # Final version, optimized for Render/Docker.
 # THIS VERSION HAS BEEN MODIFIED to include the "Sort the Chat" minigame.
 # The external server communication for commands has been removed in favor of this self-contained game.
+# CORRECTED: Fixed the "SyntaxError: name is used prior to global declaration" bug.
 
 import os
 import queue
@@ -9,14 +10,14 @@ import atexit
 import logging
 import threading
 import traceback
-import random # <-- ADDED FOR THE GAME
+import random
 import time
 from datetime import datetime
 from collections import deque
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, Response, request, redirect, url_for
+from flask import Flask, Response
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -26,19 +27,18 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException, TimeoutException
 
 # --- CONFIGURATION ---
-# Removed BOT_SERVER_URL and API_KEY as they are no longer needed for the game logic.
-SHIP_INVITE_LINK = 'https://drednot.io/invite/KOciB52Quo4z_luxo7zAFKPc'
-ANONYMOUS_LOGIN_KEY = '_M85tFxFxIRDax_nh-HYm1gT' # Replace with your key if needed
+SHIP_INVITE_LINK = os.environ.get("SHIP_INVITE_LINK", 'https://drednot.io/invite/elFrrxDttMHVZa5UK25jT6Sk')
+ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", '_M85tFxFxIRDax_nh-HYm1gT')
 
 # Bot Behavior
-MESSAGE_DELAY_SECONDS = 1.2 # Game-friendly delay
+MESSAGE_DELAY_SECONDS = 1.2
 ZWSP = '\u200B'
-INACTIVITY_TIMEOUT_SECONDS = 5 * 60 # Increased for game
+INACTIVITY_TIMEOUT_SECONDS = 5 * 60
 MAIN_LOOP_POLLING_INTERVAL_SECONDS = 0.05
 MAX_WORKER_THREADS = 10
 
 # Spam Control
-USER_COOLDOWN_SECONDS = 1.0 # Allow faster !yes/!no
+USER_COOLDOWN_SECONDS = 1.0
 SPAM_STRIKE_LIMIT = 5
 SPAM_TIMEOUT_SECONDS = 30
 SPAM_RESET_SECONDS = 5
@@ -50,10 +50,8 @@ if not SHIP_INVITE_LINK: logging.critical("FATAL: SHIP_INVITE_LINK environment v
 
 # --- JAVASCRIPT INJECTION SCRIPT (Unchanged) ---
 MUTATION_OBSERVER_SCRIPT = """
-    window.isDrednotBotObserverActive = false;
-    if (window.drednotBotMutationObserver) { window.drednotBotMutationObserver.disconnect(); console.log('[Bot-JS] Disconnected old observer.'); }
-    window.isDrednotBotObserverActive = true; console.log('[Bot-JS] Initializing Observer...');
-    window.py_bot_events = [];
+    window.isDrednotBotObserverActive = false; if (window.drednotBotMutationObserver) { window.drednotBotMutationObserver.disconnect(); console.log('[Bot-JS] Disconnected old observer.'); }
+    window.isDrednotBotObserverActive = true; console.log('[Bot-JS] Initializing Observer...'); window.py_bot_events = [];
     const zwsp = arguments[0], allCommands = arguments[1], cooldownMs = arguments[2] * 1000,
           spamStrikeLimit = arguments[3], spamTimeoutMs = arguments[4] * 1000, spamResetMs = arguments[5] * 1000;
     const commandSet = new Set(allCommands); window.botUserCooldowns = window.botUserCooldowns || {};
@@ -107,64 +105,17 @@ atexit.register(lambda: command_executor.shutdown(wait=True))
 
 GAME_STATE = {}
 EVENT_DECK = []
-game_lock = Lock() # Use this lock to protect GAME_STATE from race conditions
+game_lock = Lock()
 
 # --- GAME DATA (EVENTS) ---
 EVENTS = [
-    {
-        "petitioner": "A Farmer",
-        "text": "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds or we'll starve.",
-        "onYes": {"text": "The farmers are grateful! They begin replanting with the funds you provided.", "effects": {"treasury": -50, "happiness": 15, "population": 5}},
-        "onNo":  {"text": "The farmers despair. The blight spreads, and the harvest is meager.", "effects": {"happiness": -15, "population": -10}}
-    },
-    {
-        "petitioner": "The Royal Architect",
-        "text": "Your majesty, for 75 gold, I can build a grand aqueduct, improving sanitation and bringing fresh water to the city!",
-        "onYes": {
-            "text": "Construction begins! The aqueduct is a marvel of engineering, a symbol of your benevolent rule.",
-            "effects": {"treasury": -75},
-            "modifier": {"source": "Aqueduct", "duration": 10, "effects": {"happiness": 2, "population": 1}}
-        },
-        "onNo":  {"text": "The people grumble about the dusty streets and murky well water.", "effects": {"happiness": -5}}
-    },
-    {
-        "petitioner": "A Shady-Looking Merchant",
-        "text": "Psst, ruler... I've 'acquired' some exotic goods. A small investment of 20 gold could double your return!",
-        "onYes": [
-            {"chance": 60, "text": "The gamble pays off! The merchant returns with 40 gold.", "effects": {"treasury": 20}},
-            {"chance": 30, "text": "The goods were a fad. The merchant returns with only your initial 20 gold. No harm done.", "effects": {"treasury": 0}},
-            {"chance": 10, "text": "It was a scam! The merchant disappears with your money.", "effects": {"treasury": -20, "happiness": -5}}
-        ],
-        "onNo":  {"text": "You wisely refuse. The city guard later arrests the merchant for selling stolen property.", "effects": {"happiness": 5}}
-    },
-    {
-        "petitioner": "The Tax Collector",
-        "text": "Sire, the people complain the taxes are too high. Should we lower them to improve their mood?",
-        "onYes": {"text": "The people rejoice at the tax break! Our treasury will see less income this season.", "effects": {"treasury": -30, "happiness": 15}},
-        "onNo":  {"text": "The people sigh, but pay their taxes as required. The treasury is stable.", "effects": {"happiness": -10}}
-    },
-    {
-        "petitioner": "A Traveling Circus",
-        "text": "We are the magnificent Marvelous circus! For a mere 30 gold, we will perform for your citizens and lift their spirits!",
-        "onYes": {"text": "The circus is a hit! Laughter echoes through the city streets.", "effects": {"treasury": -30, "happiness": 25}},
-        "onNo":  {"text": "The circus packs up and leaves, taking their joy with them. The town feels a bit duller.", "effects": {"happiness": -5}}
-    },
-    {
-        "petitioner": "The Captain of the Guard",
-        "text": "My lord, our equipment is outdated. 40 gold would supply the guards with new steel armor and weapons, making the city safer.",
-        "onYes": {"text": "The guards stand taller and prouder with their new gear. Crime rates drop.", "effects": {"treasury": -40, "happiness": 10}},
-        "onNo":  {"text": "The guards continue their patrols, but their effectiveness is limited by their old gear.", "effects": {"happiness": -5}}
-    },
-    {
-        "petitioner": "An Alchemist",
-        "text": "Your eminence! My research into turning lead into gold is nearly complete. I require a 60 gold grant to finish my magnum opus!",
-        "onYes": [
-            {"chance": 5, "text": "He did it! The madman actually did it! He hands you a lump of pure gold worth 200 gold before mysteriously vanishing.", "effects": {"treasury": 140, "happiness": 10}},
-            {"chance": 25, "text": "The experiment resulted in a powerful new fertilizer. The fields will be extra bountiful next season.", "effects": {"treasury": -60, "population": 15, "happiness": 5}},
-            {"chance": 70, "text": "A small explosion rocks the lab. The alchemist sheepishly reports that he has failed, and your gold is gone.", "effects": {"treasury": -60, "happiness": -5}}
-        ],
-        "onNo":  {"text": "You dismiss the alchemist as a charlatan. He leaves the city, dejected.", "effects": {}}
-    },
+    { "petitioner": "A Farmer", "text": "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds or we'll starve.", "onYes": {"text": "The farmers are grateful! They begin replanting with the funds you provided.", "effects": {"treasury": -50, "happiness": 15, "population": 5}}, "onNo":  {"text": "The farmers despair. The blight spreads, and the harvest is meager.", "effects": {"happiness": -15, "population": -10}}},
+    { "petitioner": "The Royal Architect", "text": "Your majesty, for 75 gold, I can build a grand aqueduct, improving sanitation and bringing fresh water to the city!", "onYes": {"text": "Construction begins! The aqueduct is a marvel of engineering, a symbol of your benevolent rule.", "effects": {"treasury": -75}, "modifier": {"source": "Aqueduct", "duration": 10, "effects": {"happiness": 2, "population": 1}}}, "onNo":  {"text": "The people grumble about the dusty streets and murky well water.", "effects": {"happiness": -5}}},
+    { "petitioner": "A Shady-Looking Merchant", "text": "Psst, ruler... I've 'acquired' some exotic goods. A small investment of 20 gold could double your return!", "onYes": [ {"chance": 60, "text": "The gamble pays off! The merchant returns with 40 gold.", "effects": {"treasury": 20}}, {"chance": 30, "text": "The goods were a fad. The merchant returns with only your initial 20 gold. No harm done.", "effects": {"treasury": 0}}, {"chance": 10, "text": "It was a scam! The merchant disappears with your money.", "effects": {"treasury": -20, "happiness": -5}}], "onNo":  {"text": "You wisely refuse. The city guard later arrests the merchant for selling stolen property.", "effects": {"happiness": 5}}},
+    { "petitioner": "The Tax Collector", "text": "Sire, the people complain the taxes are too high. Should we lower them to improve their mood?", "onYes": {"text": "The people rejoice at the tax break! Our treasury will see less income this season.", "effects": {"treasury": -30, "happiness": 15}}, "onNo":  {"text": "The people sigh, but pay their taxes as required. The treasury is stable.", "effects": {"happiness": -10}}},
+    { "petitioner": "A Traveling Circus", "text": "We are the magnificent Marvelous circus! For a mere 30 gold, we will perform for your citizens and lift their spirits!", "onYes": {"text": "The circus is a hit! Laughter echoes through the city streets.", "effects": {"treasury": -30, "happiness": 25}}, "onNo":  {"text": "The circus packs up and leaves, taking their joy with them. The town feels a bit duller.", "effects": {"happiness": -5}}},
+    { "petitioner": "The Captain of the Guard", "text": "My lord, our equipment is outdated. 40 gold would supply the guards with new steel armor and weapons, making the city safer.", "onYes": {"text": "The guards stand taller and prouder with their new gear. Crime rates drop.", "effects": {"treasury": -40, "happiness": 10}}, "onNo":  {"text": "The guards continue their patrols, but their effectiveness is limited by their old gear.", "effects": {"happiness": -5}}},
+    { "petitioner": "An Alchemist", "text": "Your eminence! My research into turning lead into gold is nearly complete. I require a 60 gold grant to finish my magnum opus!", "onYes": [ {"chance": 5, "text": "He did it! The madman actually did it! He hands you a lump of pure gold worth 200 gold before mysteriously vanishing.", "effects": {"treasury": 140, "happiness": 10}}, {"chance": 25, "text": "The experiment resulted in a powerful new fertilizer. The fields will be extra bountiful next season.", "effects": {"treasury": -60, "population": 15, "happiness": 5}}, {"chance": 70, "text": "A small explosion rocks the lab. The alchemist sheepishly reports that he has failed, and your gold is gone.", "effects": {"treasury": -60, "happiness": -5}}], "onNo":  {"text": "You dismiss the alchemist as a charlatan. He leaves the city, dejected.", "effects": {}}},
 ]
 
 # --- GAME HELPER FUNCTIONS ---
@@ -179,42 +130,31 @@ def format_effects(effects):
 def shuffle_event_deck():
     global EVENT_DECK
     logging.info("Shuffling the event deck...")
-    EVENT_DECK = EVENTS[:] # Create a copy
+    EVENT_DECK = EVENTS[:]
     random.shuffle(EVENT_DECK)
 
-# --- CORE GAME FUNCTIONS ---
+# --- CORE GAME FUNCTIONS (CORRECTED) ---
 def start_game(username):
+    global GAME_STATE  # MOVED: global declaration must be at the top of the function.
     with game_lock:
         if GAME_STATE.get("gameActive"):
             queue_reply("A game is already in progress. Use !endgame to stop it.")
             return
 
-        # Reset game state
-        global GAME_STATE
         GAME_STATE = {
-            "day": 0,
-            "treasury": 100,
-            "happiness": 50,
-            "population": 100,
-            "gameActive": True,
-            "isAwaitingDecision": False,
-            "currentEvent": None,
-            "modifiers": [],
+            "day": 0, "treasury": 100, "happiness": 50, "population": 100,
+            "gameActive": True, "isAwaitingDecision": False, "currentEvent": None, "modifiers": [],
         }
         log_event(f"GAME: New game started by {username}.")
-        queue_reply([
-            "A new reign begins! Rule your kingdom with wisdom.",
-            "Commands: !yes, !no, !status, !help, !endgame"
-        ])
+        queue_reply(["A new reign begins! Rule your kingdom with wisdom.", "Commands: !yes, !no, !status, !help, !endgame"])
         shuffle_event_deck()
     
-    # Schedule the first event outside the lock to avoid holding it during sleep
     command_executor.submit(lambda: (time.sleep(MESSAGE_DELAY_SECONDS * 2), next_event()))
 
 def end_game(reason, username):
+    global GAME_STATE # ADDED: For clarity and consistency.
     with game_lock:
-        if not GAME_STATE.get("gameActive"):
-            return
+        if not GAME_STATE.get("gameActive"): return
         log_event(f"GAME: Game ended by {username}. Reason: {reason}")
         queue_reply([
             f"--- Your reign has ended after {GAME_STATE.get('day', 0)} days. ---",
@@ -226,57 +166,42 @@ def end_game(reason, username):
         GAME_STATE["isAwaitingDecision"] = False
 
 def next_event():
+    global GAME_STATE # ADDED: For clarity and consistency.
     with game_lock:
-        if not GAME_STATE.get("gameActive"):
-            return
+        if not GAME_STATE.get("gameActive"): return
         
         # Apply daily modifiers
         modifier_log = []
         expired_modifiers = []
         for mod in GAME_STATE.get("modifiers", []):
-            for stat, effect in mod["effects"].items():
-                GAME_STATE[stat] += effect
+            for stat, effect in mod["effects"].items(): GAME_STATE[stat] += effect
             mod["duration"] -= 1
             modifier_log.append(f"{format_effects(mod['effects'])} from {mod['source']}")
-            if mod["duration"] <= 0:
-                expired_modifiers.append(mod)
+            if mod["duration"] <= 0: expired_modifiers.append(mod)
 
         GAME_STATE["modifiers"] = [mod for mod in GAME_STATE["modifiers"] if mod not in expired_modifiers]
-        if modifier_log:
-            queue_reply(f"Daily upkeep: {', '.join(modifier_log)}")
+        if modifier_log: queue_reply(f"Daily upkeep: {', '.join(modifier_log)}")
 
         # Check for game over conditions
-        if GAME_STATE.get("treasury", 0) < 0:
-            end_game("The kingdom is bankrupt!", "System")
-            return
-        if GAME_STATE.get("happiness", 0) <= 0:
-            end_game("The people have revolted due to unhappiness!", "System")
-            return
-        if GAME_STATE.get("population", 0) <= 0:
-            end_game("The kingdom has become a ghost town.", "System")
-            return
+        if GAME_STATE.get("treasury", 0) < 0: end_game("The kingdom is bankrupt!", "System"); return
+        if GAME_STATE.get("happiness", 0) <= 0: end_game("The people have revolted due to unhappiness!", "System"); return
+        if GAME_STATE.get("population", 0) <= 0: end_game("The kingdom has become a ghost town.", "System"); return
             
         GAME_STATE["day"] += 1
 
-        # Draw a new event
-        if not EVENT_DECK:
-            shuffle_event_deck()
-        
+        if not EVENT_DECK: shuffle_event_deck()
         GAME_STATE["currentEvent"] = EVENT_DECK.pop()
         GAME_STATE["isAwaitingDecision"] = True
-
         event = GAME_STATE["currentEvent"]
         queue_reply([
-            f"--- Day {GAME_STATE['day']} ---",
-            f"{event['petitioner']} approaches the throne.",
-            f"\"{event['text']}\"",
-            "How do you respond? (!yes / !no)"
+            f"--- Day {GAME_STATE['day']} ---", f"{event['petitioner']} approaches the throne.",
+            f"\"{event['text']}\"", "How do you respond? (!yes / !no)"
         ])
 
 def handle_decision(choice, username):
+    global GAME_STATE # ADDED: For clarity and consistency.
     with game_lock:
-        if not GAME_STATE.get("gameActive") or not GAME_STATE.get("isAwaitingDecision"):
-            return
+        if not GAME_STATE.get("gameActive") or not GAME_STATE.get("isAwaitingDecision"): return
         
         log_event(f"GAME: {username} chose '{choice}'.")
         GAME_STATE["isAwaitingDecision"] = False
@@ -284,41 +209,25 @@ def handle_decision(choice, username):
         decision_key = 'onYes' if choice == '!yes' else 'onNo'
         outcomes = event[decision_key]
 
-        if not isinstance(outcomes, list):
-            outcomes = [outcomes]
+        if not isinstance(outcomes, list): outcomes = [outcomes]
         
-        # Resolve probabilistic outcomes
         total_chance = sum(o.get("chance", 100) for o in outcomes)
         roll = random.uniform(0, total_chance)
-        chosen_outcome = None
+        chosen_outcome = next((o for o in outcomes if (roll := roll - o.get("chance", 100)) < 0), outcomes[-1])
         
-        for outcome in outcomes:
-            chance = outcome.get("chance", 100)
-            if roll < chance:
-                chosen_outcome = outcome
-                break
-            roll -= chance
-        
-        if not chosen_outcome: # Fallback
-            chosen_outcome = outcomes[-1]
-
-        # Apply effects and modifiers
         if "effects" in chosen_outcome:
-            for stat, value in chosen_outcome["effects"].items():
-                GAME_STATE[stat] += value
+            for stat, value in chosen_outcome["effects"].items(): GAME_STATE[stat] += value
         if "modifier" in chosen_outcome:
-            # Create a copy to avoid modifying the original event data
             GAME_STATE["modifiers"].append(dict(chosen_outcome["modifier"]))
 
-        # Give feedback
         effects_str = format_effects(chosen_outcome.get("effects", {}))
         feedback = f"{chosen_outcome['text']} ({effects_str})" if effects_str else chosen_outcome['text']
         queue_reply(feedback)
 
-    # Schedule the next event
     command_executor.submit(lambda: (time.sleep(MESSAGE_DELAY_SECONDS * 4), next_event()))
 
 def show_status(username):
+    global GAME_STATE # ADDED: For clarity and consistency.
     with game_lock:
         if not GAME_STATE.get("gameActive"):
             queue_reply("There is no active game. Type !startgame to begin.")
@@ -326,25 +235,19 @@ def show_status(username):
         
         lines = [
             f"--- Kingdom Status (Day {GAME_STATE['day']}) ---",
-            f"💰 Treasury: {GAME_STATE['treasury']}",
-            f"😊 Happiness: {GAME_STATE['happiness']}",
+            f"💰 Treasury: {GAME_STATE['treasury']}", f"😊 Happiness: {GAME_STATE['happiness']}",
             f"👨‍👩‍👧‍👦 Population: {GAME_STATE['population']}"
         ]
         if GAME_STATE.get("modifiers"):
             lines.append("--- Active Effects ---")
-            for mod in GAME_STATE["modifiers"]:
-                lines.append(f"• {mod['source']} ({mod['duration']}d left)")
-
+            for mod in GAME_STATE["modifiers"]: lines.append(f"• {mod['source']} ({mod['duration']}d left)")
         queue_reply(lines)
 
 def show_help(username):
     queue_reply([
-        "--- Sort the Chat Help ---",
-        "This is a kingdom management game where you rule by making decisions.",
-        "Reply with !yes or !no to each petitioner.",
-        "Your decisions affect your Treasury 💰, Happiness 😊, and Population 👨‍👩‍👧‍👦.",
-        "Try to keep your kingdom thriving for as long as possible!",
-        "Commands: !startgame, !endgame, !yes, !no, !status, !help"
+        "--- Sort the Chat Help ---", "This is a kingdom management game where you rule by making decisions.",
+        "Reply with !yes or !no to each petitioner.", "Your decisions affect your Treasury 💰, Happiness 😊, and Population 👨‍👩‍👧‍👦.",
+        "Try to keep your kingdom thriving for as long as possible!", "Commands: !startgame, !endgame, !yes, !no, !status, !help"
     ])
 
 # =========================================================================
@@ -357,7 +260,7 @@ def log_event(message):
     BOT_STATE["event_log"].appendleft(full_message)
     logging.info(f"EVENT: {message}")
 
-# --- BROWSER & FLASK SETUP (Unchanged but for UI text) ---
+# --- BROWSER & FLASK SETUP ---
 def setup_driver():
     logging.info("Launching headless browser for Docker environment...")
     chrome_options = Options()
@@ -373,7 +276,6 @@ def setup_driver():
 flask_app = Flask('')
 @flask_app.route('/')
 def health_check():
-    # Modified to remove the "Update Commands" button
     html = f"""
     <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10">
     <title>Drednot Bot Status</title><style>body{{font-family:'Courier New',monospace;background-color:#1e1e1e;color:#d4d4d4;padding:20px;}}.container{{max-width:800px;margin:auto;background-color:#252526;border:1px solid #373737;padding:20px;border-radius:8px;}}h1,h2{{color:#4ec9b0;border-bottom:1px solid #4ec9b0;padding-bottom:5px;}}p{{line-height:1.6;}}.status-ok{{color:#73c991;font-weight:bold;}}.label{{color:#9cdcfe;font-weight:bold;}}ul{{list-style-type:none;padding-left:0;}}li{{background-color:#2d2d2d;margin-bottom:8px;padding:10px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}}</style></head>
@@ -391,7 +293,7 @@ def run_flask():
     logging.info(f"Health check server listening on http://0.0.0.0:{port}")
     flask_app.run(host='0.0.0.0', port=port)
 
-# --- HELPER & CORE FUNCTIONS (Unchanged) ---
+# --- HELPER & CORE FUNCTIONS ---
 def queue_reply(message):
     MAX_LEN = 199
     lines = message if isinstance(message, list) else [message]
@@ -408,9 +310,7 @@ def queue_reply(message):
                     if chunk: message_queue.put(ZWSP + chunk, timeout=5)
                     text = text[bp if bp > 0 else MAX_LEN:].strip()
             except queue.Full:
-                logging.warning("Message queue is full. Dropping message.")
-                log_event("WARN: Message queue full.")
-                break
+                logging.warning("Message queue is full. Dropping message."); log_event("WARN: Message queue full."); break
 
 def message_processor_thread():
     while True:
@@ -418,27 +318,19 @@ def message_processor_thread():
         try:
             with driver_lock:
                 if driver:
-                    driver.execute_script(
-                        "const msg=arguments[0];const chatBox=document.getElementById('chat');const chatInp=document.getElementById('chat-input');const chatBtn=document.getElementById('chat-send');if(chatBox&&chatBox.classList.contains('closed')){chatBtn.click();}if(chatInp){chatInp.value=msg;}chatBtn.click();",
-                        message
-                    )
-            clean_msg = message[1:]
-            logging.info(f"SENT: {clean_msg}")
-            BOT_STATE["last_message_sent"] = clean_msg
-        except WebDriverException:
-            logging.warning("Message processor: WebDriver not available.")
-        except Exception as e:
-            logging.error(f"Unexpected error in message processor: {e}")
+                    driver.execute_script("const msg=arguments[0];const chatBox=document.getElementById('chat');const chatInp=document.getElementById('chat-input');const chatBtn=document.getElementById('chat-send');if(chatBox&&chatBox.classList.contains('closed')){chatBtn.click();}if(chatInp){chatInp.value=msg;}chatBtn.click();", message)
+            clean_msg = message[1:]; logging.info(f"SENT: {clean_msg}"); BOT_STATE["last_message_sent"] = clean_msg
+        except WebDriverException: logging.warning("Message processor: WebDriver not available.")
+        except Exception as e: logging.error(f"Unexpected error in message processor: {e}")
         time.sleep(MESSAGE_DELAY_SECONDS)
 
-# --- BOT MANAGEMENT FUNCTIONS (Modified to remove server dependency) ---
+# --- BOT MANAGEMENT FUNCTIONS ---
 def reset_inactivity_timer():
     global inactivity_timer
     if inactivity_timer: inactivity_timer.cancel()
     inactivity_timer = threading.Timer(INACTIVITY_TIMEOUT_SECONDS, lambda: log_event("INACTIVITY: Timer expired. No action taken in this version."))
 
 def fetch_command_list():
-    """MODIFIED: This now provides a static list of game commands instead of fetching from a server."""
     global SERVER_COMMAND_LIST
     log_event("Loading static game command list...")
     SERVER_COMMAND_LIST = ["startgame", "endgame", "yes", "no", "status", "help"]
@@ -446,31 +338,22 @@ def fetch_command_list():
     return True
 
 def queue_browser_update():
-    """Queues an action to re-inject the JS observer with the current command list."""
     with driver_lock:
         if driver:
             log_event("Injecting/updating chat observer with game commands...")
-            driver.execute_script(
-                MUTATION_OBSERVER_SCRIPT, ZWSP, SERVER_COMMAND_LIST, USER_COOLDOWN_SECONDS,
-                SPAM_STRIKE_LIMIT, SPAM_TIMEOUT_SECONDS, SPAM_RESET_SECONDS
-            )
+            driver.execute_script(MUTATION_OBSERVER_SCRIPT, ZWSP, SERVER_COMMAND_LIST, USER_COOLDOWN_SECONDS, SPAM_STRIKE_LIMIT, SPAM_TIMEOUT_SECONDS, SPAM_RESET_SECONDS)
 
-# --- MAIN BOT LOGIC (Modified for Game) ---
+# --- MAIN BOT LOGIC ---
 def start_bot(use_key_login):
     global driver
-    BOT_STATE["status"] = "Launching Browser..."
-    log_event("Performing full start...")
+    BOT_STATE["status"] = "Launching Browser..."; log_event("Performing full start...")
     driver = setup_driver()
     
-    # ... [The rest of the start_bot function is largely the same, focusing on login and setup]
     with driver_lock:
-        logging.info(f"Navigating to invite link...")
-        driver.get(SHIP_INVITE_LINK)
-        # ... [omitting the long login try/except block for brevity, it's unchanged] ...
+        logging.info(f"Navigating to invite link..."); driver.get(SHIP_INVITE_LINK)
         try:
             btn = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".modal-container .btn-green")))
-            driver.execute_script("arguments[0].click();", btn)
-            logging.info("Clicked 'Accept' on notice.")
+            driver.execute_script("arguments[0].click();", btn); logging.info("Clicked 'Accept' on notice.")
             if ANONYMOUS_LOGIN_KEY and use_key_login:
                  log_event("Attempting login with hardcoded key.")
                  link = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//a[contains(., 'Restore old anonymous key')]")))
@@ -491,7 +374,7 @@ def start_bot(use_key_login):
 
         WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.ID, "chat-input")))
         if not fetch_command_list(): raise RuntimeError("Initial command load failed.")
-        queue_browser_update() # Replaces the more complex initial setup
+        queue_browser_update()
     
     BOT_STATE["status"] = "Running"
     queue_reply("Sort the Chat Bot is online! Type !startgame to begin.")
@@ -507,7 +390,7 @@ def start_bot(use_key_login):
             if new_events:
                 reset_inactivity_timer()
                 for event in new_events:
-                    if event['type'] == 'ship_joined': # Unchanged ship join logic
+                    if event['type'] == 'ship_joined':
                         BOT_STATE["current_ship_id"] = event['id']
                         log_event(f"Joined/Identified ship: {BOT_STATE['current_ship_id']}")
                     
@@ -516,56 +399,40 @@ def start_bot(use_key_login):
                         command_str = f"!{cmd}"
                         logging.info(f"RECV: '{command_str}' from {user}")
                         BOT_STATE["last_command_info"] = f"{command_str} (from {user})"
-
-                        # --- GAME COMMAND ROUTER ---
-                        if cmd == "startgame":
-                            command_executor.submit(start_game, user)
-                        elif cmd == "endgame":
-                            command_executor.submit(end_game, "You have abdicated the throne.", user)
-                        elif cmd in ["yes", "no"]:
-                            command_executor.submit(handle_decision, f"!{cmd}", user)
-                        elif cmd == "status":
-                            command_executor.submit(show_status, user)
-                        elif cmd == "help":
-                            command_executor.submit(show_help, user)
+                        
+                        route = { "startgame": start_game, "endgame": lambda u: end_game("You have abdicated the throne.", u),
+                                  "yes": lambda u: handle_decision("!yes", u), "no": lambda u: handle_decision("!no", u),
+                                  "status": show_status, "help": show_help }.get(cmd)
+                        if route: command_executor.submit(route, user)
 
                     elif event['type'] == 'spam_detected':
                         username, command = event['username'], event['command']
                         log_event(f"SPAM: Timed out '{username}' for {SPAM_TIMEOUT_SECONDS}s for spamming '!{command}'.")
 
-        except WebDriverException as e:
-            logging.error(f"WebDriver exception in main loop. Assuming disconnect: {e.msg}")
-            raise
+        except WebDriverException as e: logging.error(f"WebDriver exception in main loop. Assuming disconnect: {e.msg}"); raise
         time.sleep(MAIN_LOOP_POLLING_INTERVAL_SECONDS)
 
-# --- MAIN EXECUTION (Unchanged, but now runs the game bot) ---
+# --- MAIN EXECUTION ---
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=message_processor_thread, daemon=True).start()
-
     use_key_login = True
     while True:
-        try:
-            start_bot(use_key_login)
+        try: start_bot(use_key_login)
         except Exception as e:
             if "Login Failed" in str(e):
-                BOT_STATE["status"] = "Invalid Key!"
-                err_msg = f"CRITICAL: {e}. Switching to Guest Mode for next restart."
-                log_event(err_msg); logging.error(err_msg)
-                use_key_login = False
+                BOT_STATE["status"] = "Invalid Key!"; err_msg = f"CRITICAL: {e}. Switching to Guest Mode for next restart."
+                log_event(err_msg); logging.error(err_msg); use_key_login = False
             else:
-                BOT_STATE["status"] = "Crashed! Restarting..."
-                log_event(f"CRITICAL ERROR: {e}")
-                logging.critical(f"Full restart. Reason: {e}")
-                traceback.print_exc()
+                BOT_STATE["status"] = "Crashed! Restarting..."; log_event(f"CRITICAL ERROR: {e}")
+                logging.critical(f"Full restart. Reason: {e}"); traceback.print_exc()
         finally:
             global driver
             if inactivity_timer: inactivity_timer.cancel()
             if driver:
                 try: driver.quit()
                 except: pass
-            driver = None
-            time.sleep(5)
+            driver = None; time.sleep(5)
 
 if __name__ == "__main__":
     main()
