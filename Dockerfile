@@ -1,23 +1,30 @@
-# Step 1: Start from an official base image.
-# This image is provided by the Puppeteer team. It includes Node.js and all the
-# complex system libraries that Chrome needs to run. This saves us a ton of work.
-FROM ghcr.io/puppeteer/puppeteer:21.5.0
+# Step 1: Start with a lean, official Python base image.
+# We use Debian "slim" as a base because it's smaller than the full version.
+FROM python:3.11-slim
 
 # Step 2: Set the working directory inside the container.
-# All subsequent commands will run from this path.
-WORKDIR /usr/src/app
+WORKDIR /app
 
-# Step 3: Copy the package files and install dependencies.
-# We copy package.json and package-lock.json *first*. Docker caches layers,
-# so if our source code changes but our dependencies don't, Docker can skip
-# the time-consuming `npm install` step on future builds.
-COPY package*.json ./
-RUN npm install
+# Step 3: Install system dependencies.
+# We need to install the Chromium browser and its matching Selenium driver.
+# This is the most critical step for making Selenium work headlessly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    chromium-driver \
+    && rm -rf /var/lib/apt/lists/*
 
-# Step 4: Copy the rest of our application's source code.
-# This copies bot.js and any other files into the working directory.
+# Step 4: Install Python dependencies.
+# We copy requirements.txt first to take advantage of Docker's layer caching.
+# This makes subsequent builds much faster if the requirements haven't changed.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Step 5: Copy your application code into the container.
 COPY . .
 
-# Step 5: Define the command to run when the container starts.
-# This tells Render to run our bot script with Node.js.
-CMD [ "node", "bot.js" ]
+# Step 6: Expose the port your Flask web server will run on.
+# Render will use this to route traffic for health checks.
+EXPOSE 8080
+
+# Step 7: Define the command to run when the container starts.
+CMD ["python", "drednot_bot.py"]
