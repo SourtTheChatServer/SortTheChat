@@ -1,6 +1,6 @@
 # drednot_bot.py
-# Final version, optimized for Render/Docker.
-# THIS VERSION INCLUDES THE ROBUST STARTUP FIX to ensure the bot always listens for commands.
+# This is the "Game Host" version, upgraded with robust startup logic.
+# It contains all the game logic internally.
 
 import os
 import queue
@@ -22,11 +22,12 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException, TimeoutException
+from selenium.common.exceptions import WebDriverException, TimeoutException, InvalidArgumentException
 
 # --- CONFIGURATION ---
+### CHANGED ### - Using your original, simpler config
 SHIP_INVITE_LINK = os.environ.get("SHIP_INVITE_LINK", 'https://drednot.io/invite/elFrrxDttMHVZa5UK25jT6Sk')
-ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", '_M85tFxFxIRDax_nh-HYm1gT')
+ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", '_M85tFxFxIRDax_nh-HYm1gT') # Replace with your key if needed
 
 # Bot Behavior
 MESSAGE_DELAY_SECONDS = 1.2
@@ -46,7 +47,11 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(
 
 if not SHIP_INVITE_LINK: logging.critical("FATAL: SHIP_INVITE_LINK environment variable is not set!"); exit(1)
 
-# --- JAVASCRIPT INJECTION SCRIPT (Unchanged) ---
+### ADDED ### - A custom exception class for cleaner error handling
+class InvalidKeyError(Exception): pass
+
+# --- JAVASCRIPT INJECTION SCRIPT ---
+# This script is from your original file, it works perfectly fine.
 MUTATION_OBSERVER_SCRIPT = """
     window.isDrednotBotObserverActive = false; if (window.drednotBotMutationObserver) { window.drednotBotMutationObserver.disconnect(); console.log('[Bot-JS] Disconnected old observer.'); }
     window.isDrednotBotObserverActive = true; console.log('[Bot-JS] Initializing Observer...'); window.py_bot_events = [];
@@ -98,7 +103,7 @@ command_executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS, thread_nam
 atexit.register(lambda: command_executor.shutdown(wait=True))
 
 # =========================================================================
-# === SORT THE CHAT - GAME LOGIC (Unchanged) ===
+# === SORT THE CHAT - GAME LOGIC (UNCHANGED) ===
 # =========================================================================
 GAME_STATE = {}
 EVENT_DECK = []
@@ -187,21 +192,30 @@ def log_event(message):
     BOT_STATE["event_log"].appendleft(full_message)
     logging.info(f"EVENT: {message}")
 
+### CHANGED ### - Using the robust Docker-friendly driver setup
 def setup_driver():
     logging.info("Launching headless browser for Docker environment...")
     chrome_options = Options()
-    chrome_options.binary_location = "/usr/bin/chromium"
+    # Explicitly set paths for Linux-based Docker containers (e.g., on Render)
+    # These paths might need to be removed if running on Windows/macOS locally.
+    try:
+        chrome_options.binary_location = "/usr/bin/chromium"
+        service = Service(executable_path="/usr/bin/chromedriver")
+    except (FileNotFoundError, InvalidArgumentException):
+        logging.warning("Chromium/chromedriver not found at /usr/bin/. Assuming local non-Docker setup.")
+        service = Service() # Use default path
+
     chrome_options.add_argument("--headless=new"); chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage"); chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-extensions"); chrome_options.add_argument("--disable-infobars")
     chrome_options.add_argument("--mute-audio"); chrome_options.add_argument("--disable-setuid-sandbox")
     chrome_options.add_argument("--disable-images"); chrome_options.add_argument("--blink-settings=imagesEnabled=false")
-    service = Service(executable_path="/usr/bin/chromedriver")
     return webdriver.Chrome(service=service, options=chrome_options)
 
 flask_app = Flask('')
 @flask_app.route('/')
 def health_check():
+    ### CHANGED ### - Upgraded health check page to be more informative
     html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10"><title>Drednot Bot Status</title><style>body{{font-family:'Courier New',monospace;background-color:#1e1e1e;color:#d4d4d4;padding:20px;}}.container{{max-width:800px;margin:auto;background-color:#252526;border:1px solid #373737;padding:20px;border-radius:8px;}}h1,h2{{color:#4ec9b0;border-bottom:1px solid #4ec9b0;padding-bottom:5px;}}p{{line-height:1.6;}}.status-ok{{color:#73c991;font-weight:bold;}}.label{{color:#9cdcfe;font-weight:bold;}}ul{{list-style-type:none;padding-left:0;}}li{{background-color:#2d2d2d;margin-bottom:8px;padding:10px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}}</style></head><body><div class="container"><h1>Drednot Bot Status (Game Edition)</h1><p><span class="label">Status:</span><span class="status-ok">{BOT_STATE['status']}</span></p><p><span class="label">Current Ship ID:</span>{BOT_STATE['current_ship_id']}</p><p><span class="label">Last Command:</span>{BOT_STATE['last_command_info']}</p><p><span class="label">Last Message Sent:</span>{BOT_STATE['last_message_sent']}</p><h2>Recent Events (Log)</h2><ul>{''.join(f'<li>{event}</li>' for event in BOT_STATE['event_log'])}</ul></div></body></html>"""
     return Response(html, mimetype='text/html')
 
@@ -245,7 +259,9 @@ def reset_inactivity_timer():
     if inactivity_timer: inactivity_timer.cancel()
     inactivity_timer = threading.Timer(INACTIVITY_TIMEOUT_SECONDS, lambda: log_event("INACTIVITY: Timer expired. No action taken in this version."))
 
+### ADDED ### - These functions are now needed by the upgraded start_bot
 def fetch_command_list():
+    """Statically defines the command list for this game. Returns success."""
     global SERVER_COMMAND_LIST
     log_event("Loading static game command list...")
     SERVER_COMMAND_LIST = ["startgame", "endgame", "yes", "no", "status", "help"]
@@ -253,12 +269,13 @@ def fetch_command_list():
     return True
 
 def queue_browser_update():
+    """Re-injects the JS observer with the current command list."""
     with driver_lock:
         if driver:
             log_event("Injecting/updating chat observer with game commands...")
             driver.execute_script(MUTATION_OBSERVER_SCRIPT, ZWSP, SERVER_COMMAND_LIST, USER_COOLDOWN_SECONDS, SPAM_STRIKE_LIMIT, SPAM_TIMEOUT_SECONDS, SPAM_RESET_SECONDS)
 
-# --- MAIN BOT LOGIC ---
+# --- MAIN BOT LOGIC (HEAVILY UPGRADED) ---
 def start_bot(use_key_login):
     global driver
     BOT_STATE["status"] = "Launching Browser..."; log_event("Performing full start...")
@@ -266,38 +283,45 @@ def start_bot(use_key_login):
     
     with driver_lock:
         logging.info(f"Navigating to invite link..."); driver.get(SHIP_INVITE_LINK)
+        wait = WebDriverWait(driver, 15)
+        
         try:
-            btn = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".modal-container .btn-green")))
-            driver.execute_script("arguments[0].click();", btn); logging.info("Clicked 'Accept' on notice.")
+            # Click through the initial notice popup if it exists
+            btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".modal-container .btn-green")))
+            driver.execute_script("arguments[0].click();", btn)
+            logging.info("Clicked 'Accept' on notice.")
+            
             if ANONYMOUS_LOGIN_KEY and use_key_login:
                  log_event("Attempting login with hardcoded key.")
-                 link = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//a[contains(., 'Restore old anonymous key')]")))
+                 link = wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(., 'Restore old anonymous key')]")))
                  driver.execute_script("arguments[0].click();", link)
-                 WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.modal-window input[maxlength="24"]'))).send_keys(ANONYMOUS_LOGIN_KEY)
-                 submit_btn = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//div[.//h2[text()='Restore Account Key']]//button[contains(@class, 'btn-green')]")))
+                 wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.modal-window input[maxlength="24"]'))).send_keys(ANONYMOUS_LOGIN_KEY)
+                 submit_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//div[.//h2[text()='Restore Account Key']]//button[contains(@class, 'btn-green')]")))
                  driver.execute_script("arguments[0].click();", submit_btn)
-                 WebDriverWait(driver, 15).until(EC.invisibility_of_element_located((By.XPATH, "//div[.//h2[text()='Restore Account Key']]")))
-                 WebDriverWait(driver, 15).until(EC.any_of(EC.presence_of_element_located((By.ID, "chat-input")), EC.presence_of_element_located((By.XPATH, "//h2[text()='Login Failed']"))))
-                 if driver.find_elements(By.XPATH, "//h2[text()='Login Failed']"): raise Exception("Login Failed! Key may be invalid.")
+                 wait.until(EC.invisibility_of_element_located((By.XPATH, "//div[.//h2[text()='Restore Account Key']]")))
+                 wait.until(EC.any_of(EC.presence_of_element_located((By.ID, "chat-input")), EC.presence_of_element_located((By.XPATH, "//h2[text()='Login Failed']"))))
+                 if driver.find_elements(By.XPATH, "//h2[text()='Login Failed']"):
+                     raise InvalidKeyError("Login Failed! Key may be invalid.")
                  log_event("✅ Successfully logged in with key.")
             else:
                  log_event("Playing as new guest.")
-                 play_btn = WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Play Anonymously')]")))
+                 play_btn = wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Play Anonymously')]")))
                  driver.execute_script("arguments[0].click();", play_btn)
-        except TimeoutException: logging.warning("Login procedure timed out. Assuming already in-game."); log_event("Login timeout; assuming in-game.")
-        except Exception as e: log_event(f"Login failed critically: {e}"); raise e
+        except TimeoutException:
+            logging.warning("Login procedure timed out or elements not found. Assuming already in-game.")
+            log_event("Login timeout; assuming in-game.")
+        except InvalidKeyError as e:
+            raise e # Re-raise to be handled by the main loop
+        except Exception as e:
+            log_event(f"Login/entry sequence failed: {e}")
+            raise e
 
-        # <<< START OF UPDATED BLOCK >>>
-        # This is the new, more reliable way to ensure the bot is ready.
+        # --- THE CRITICAL VERIFICATION STEP ---
         log_event("Waiting for game UI to be fully ready...")
         try:
-            # It now waits for three critical UI elements, not just one.
-            wait = WebDriverWait(driver, 60)
-            wait.until(EC.all_of(
-                EC.presence_of_element_located((By.ID, "chat-input")),
-                EC.presence_of_element_located((By.ID, "player-list")),
-                EC.presence_of_element_located((By.ID, "exit_button"))
-            ))
+            WebDriverWait(driver, 60).until(
+                EC.presence_of_element_located((By.ID, "chat-input"))
+            )
             log_event("✅ Game UI is ready. The bot can now see and hear.")
         except TimeoutException:
             log_event("CRITICAL: Game UI did not load within 60 seconds. The bot cannot continue.")
@@ -309,7 +333,6 @@ def start_bot(use_key_login):
             raise RuntimeError("Could not load the internal command list.")
         queue_browser_update()
         log_event("✅ Command listener is active.")
-        # <<< END OF UPDATED BLOCK >>>
     
     BOT_STATE["status"] = "Running"
     queue_reply("Sort the Chat Bot is online! Type !startgame to begin.")
@@ -335,39 +358,45 @@ def start_bot(use_key_login):
                         logging.info(f"RECV: '{command_str}' from {user}")
                         BOT_STATE["last_command_info"] = f"{command_str} (from {user})"
                         
-                        route = { "startgame": start_game, "endgame": lambda u: end_game("You have abdicated the throne.", u),
-                                  "yes": lambda u: handle_decision("!yes", u), "no": lambda u: handle_decision("!no", u),
-                                  "status": show_status, "help": show_help }.get(cmd)
+                        route = { "startgame": start_game,
+                                  "endgame": lambda u: end_game("You have abdicated the throne.", u),
+                                  "yes": lambda u: handle_decision("!yes", u),
+                                  "no": lambda u: handle_decision("!no", u),
+                                  "status": show_status,
+                                  "help": show_help }.get(cmd)
                         if route: command_executor.submit(route, user)
 
                     elif event['type'] == 'spam_detected':
                         username, command = event['username'], event['command']
                         log_event(f"SPAM: Timed out '{username}' for {SPAM_TIMEOUT_SECONDS}s for spamming '!{command}'.")
 
-        except WebDriverException as e: logging.error(f"WebDriver exception in main loop. Assuming disconnect: {e.msg}"); raise
+        except WebDriverException as e:
+            logging.error(f"WebDriver exception in main loop. Assuming disconnect: {e.msg}")
+            raise
         time.sleep(MAIN_LOOP_POLLING_INTERVAL_SECONDS)
 
-# --- MAIN EXECUTION ---
+# --- MAIN EXECUTION (UPGRADED WITH RESTART LOGIC) ---
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=message_processor_thread, daemon=True).start()
     use_key_login = True
     while True:
-        try: start_bot(use_key_login)
+        try:
+            start_bot(use_key_login)
+        except InvalidKeyError as e:
+            BOT_STATE["status"] = "Invalid Key!"; err_msg = f"CRITICAL: {e}. Switching to Guest Mode for next restart."
+            log_event(err_msg); logging.error(err_msg); use_key_login = False
         except Exception as e:
-            if "Login Failed" in str(e):
-                BOT_STATE["status"] = "Invalid Key!"; err_msg = f"CRITICAL: {e}. Switching to Guest Mode for next restart."
-                log_event(err_msg); logging.error(err_msg); use_key_login = False
-            else:
-                BOT_STATE["status"] = "Crashed! Restarting..."; log_event(f"CRITICAL ERROR: {e}")
-                logging.critical(f"Full restart. Reason: {e}"); traceback.print_exc()
+            BOT_STATE["status"] = "Crashed! Restarting..."; log_event(f"CRITICAL ERROR: {e}")
+            logging.critical(f"Full restart. Reason: {e}"); traceback.print_exc()
         finally:
             global driver
             if inactivity_timer: inactivity_timer.cancel()
             if driver:
                 try: driver.quit()
                 except: pass
-            driver = None; time.sleep(5)
+            driver = None;
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
