@@ -1,6 +1,6 @@
 # drednot_bot.py
-# This is the "Game Host" version, upgraded with robust startup logic.
-# It contains all the game logic internally.
+# This is the "Game Host" version, upgraded with a robust JavaScript parser
+# to fix the issue of not hearing commands.
 
 import os
 import queue
@@ -25,9 +25,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import WebDriverException, TimeoutException, InvalidArgumentException
 
 # --- CONFIGURATION ---
-### CHANGED ### - Using your original, simpler config
 SHIP_INVITE_LINK = os.environ.get("SHIP_INVITE_LINK", 'https://drednot.io/invite/elFrrxDttMHVZa5UK25jT6Sk')
-ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", '_M85tFxFxIRDax_nh-HYm1gT') # Replace with your key if needed
+ANONYMOUS_LOGIN_KEY = os.environ.get("ANONYMOUS_LOGIN_KEY", '_M85tFxFxIRDax_nh-HYm1gT')
 
 # Bot Behavior
 MESSAGE_DELAY_SECONDS = 1.2
@@ -47,14 +46,12 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(
 
 if not SHIP_INVITE_LINK: logging.critical("FATAL: SHIP_INVITE_LINK environment variable is not set!"); exit(1)
 
-### ADDED ### - A custom exception class for cleaner error handling
 class InvalidKeyError(Exception): pass
 
-# --- JAVASCRIPT INJECTION SCRIPT ---
-# This script is from your original file, it works perfectly fine.
+# --- JAVASCRIPT INJECTION SCRIPT (UPGRADED FOR MODERN DREDNOT.IO) ---
 MUTATION_OBSERVER_SCRIPT = """
     window.isDrednotBotObserverActive = false; if (window.drednotBotMutationObserver) { window.drednotBotMutationObserver.disconnect(); console.log('[Bot-JS] Disconnected old observer.'); }
-    window.isDrednotBotObserverActive = true; console.log('[Bot-JS] Initializing Observer...'); window.py_bot_events = [];
+    window.isDrednotBotObserverActive = true; console.log('[Bot-JS] Initializing Upgraded Observer...'); window.py_bot_events = [];
     const zwsp = arguments[0], allCommands = arguments[1], cooldownMs = arguments[2] * 1000,
           spamStrikeLimit = arguments[3], spamTimeoutMs = arguments[4] * 1000, spamResetMs = arguments[5] * 1000;
     const commandSet = new Set(allCommands); window.botUserCooldowns = window.botUserCooldowns || {};
@@ -68,12 +65,32 @@ MUTATION_OBSERVER_SCRIPT = """
                 if (node.nodeType !== 1 || node.tagName !== 'P' || node.dataset.botProcessed) continue;
                 node.dataset.botProcessed = 'true'; const pText = node.textContent || "";
                 if (pText.startsWith(zwsp)) continue;
-                if (pText.includes("Joined ship '")) { const match = pText.match(/{[A-Z\\d]+}/); if (match && match[0]) window.py_bot_events.push({ type: 'ship_joined', id: match[0] }); continue; }
-                const colonIdx = pText.indexOf(':'); if (colonIdx === -1) continue;
-                const bdiElement = node.querySelector("bdi"); if (!bdiElement) continue;
-                const username = bdiElement.innerText.trim(); const msgTxt = pText.substring(colonIdx + 1).trim();
+                
+                // --- START OF NEW, ROBUST PARSING LOGIC ---
+                // System messages like "Joined ship" or "It's only you here" are handled here.
+                if (pText.includes("Joined ship '")) { 
+                    const match = pText.match(/{[A-Z\\d]+}/); 
+                    if (match && match[0]) window.py_bot_events.push({ type: 'ship_joined', id: match[0] }); 
+                    continue; 
+                }
+
+                // A regular chat message must have a colon.
+                const colonIdx = pText.indexOf(':');
+                if (colonIdx === -1) continue;
+                
+                // Find all <bdi> tags. The last one is always the username.
+                const bdiElements = node.querySelectorAll("bdi");
+                if (bdiElements.length === 0) continue;
+                const usernameElement = bdiElements[bdiElements.length - 1];
+                const username = usernameElement.innerText.trim();
+                
+                // The command is everything after the colon.
+                const msgTxt = pText.substring(colonIdx + 1).trim();
+                // --- END OF NEW, ROBUST PARSING LOGIC ---
+
                 if (!msgTxt.startsWith('!')) continue; const parts = msgTxt.slice(1).trim().split(/ +/);
                 const command = parts.shift().toLowerCase(); if (!commandSet.has(command)) continue;
+                
                 const spamTracker = window.botSpamTracker[username] = window.botSpamTracker[username] || { count: 0, lastCmd: '', lastTime: 0, penaltyUntil: 0 };
                 if (now < spamTracker.penaltyUntil) continue;
                 const lastCmdTime = window.botUserCooldowns[username] || 0; if (now - lastCmdTime < cooldownMs) continue;
@@ -89,7 +106,7 @@ MUTATION_OBSERVER_SCRIPT = """
         }
     };
     const observer = new MutationObserver(callback); observer.observe(targetNode, { childList: true });
-    window.drednotBotMutationObserver = observer; console.log('[Bot-JS] Advanced Spam Detection is now active.');
+    window.drednotBotMutationObserver = observer; console.log('[Bot-JS] Upgraded Spam Detection is now active.');
 """
 
 # --- GLOBAL STATE & THREADING PRIMITIVES ---
@@ -192,18 +209,15 @@ def log_event(message):
     BOT_STATE["event_log"].appendleft(full_message)
     logging.info(f"EVENT: {message}")
 
-### CHANGED ### - Using the robust Docker-friendly driver setup
 def setup_driver():
     logging.info("Launching headless browser for Docker environment...")
     chrome_options = Options()
-    # Explicitly set paths for Linux-based Docker containers (e.g., on Render)
-    # These paths might need to be removed if running on Windows/macOS locally.
     try:
         chrome_options.binary_location = "/usr/bin/chromium"
         service = Service(executable_path="/usr/bin/chromedriver")
     except (FileNotFoundError, InvalidArgumentException):
         logging.warning("Chromium/chromedriver not found at /usr/bin/. Assuming local non-Docker setup.")
-        service = Service() # Use default path
+        service = Service()
 
     chrome_options.add_argument("--headless=new"); chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage"); chrome_options.add_argument("--disable-gpu")
@@ -215,7 +229,6 @@ def setup_driver():
 flask_app = Flask('')
 @flask_app.route('/')
 def health_check():
-    ### CHANGED ### - Upgraded health check page to be more informative
     html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta http-equiv="refresh" content="10"><title>Drednot Bot Status</title><style>body{{font-family:'Courier New',monospace;background-color:#1e1e1e;color:#d4d4d4;padding:20px;}}.container{{max-width:800px;margin:auto;background-color:#252526;border:1px solid #373737;padding:20px;border-radius:8px;}}h1,h2{{color:#4ec9b0;border-bottom:1px solid #4ec9b0;padding-bottom:5px;}}p{{line-height:1.6;}}.status-ok{{color:#73c991;font-weight:bold;}}.label{{color:#9cdcfe;font-weight:bold;}}ul{{list-style-type:none;padding-left:0;}}li{{background-color:#2d2d2d;margin-bottom:8px;padding:10px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}}</style></head><body><div class="container"><h1>Drednot Bot Status (Game Edition)</h1><p><span class="label">Status:</span><span class="status-ok">{BOT_STATE['status']}</span></p><p><span class="label">Current Ship ID:</span>{BOT_STATE['current_ship_id']}</p><p><span class="label">Last Command:</span>{BOT_STATE['last_command_info']}</p><p><span class="label">Last Message Sent:</span>{BOT_STATE['last_message_sent']}</p><h2>Recent Events (Log)</h2><ul>{''.join(f'<li>{event}</li>' for event in BOT_STATE['event_log'])}</ul></div></body></html>"""
     return Response(html, mimetype='text/html')
 
@@ -259,7 +272,6 @@ def reset_inactivity_timer():
     if inactivity_timer: inactivity_timer.cancel()
     inactivity_timer = threading.Timer(INACTIVITY_TIMEOUT_SECONDS, lambda: log_event("INACTIVITY: Timer expired. No action taken in this version."))
 
-### ADDED ### - These functions are now needed by the upgraded start_bot
 def fetch_command_list():
     """Statically defines the command list for this game. Returns success."""
     global SERVER_COMMAND_LIST
@@ -275,7 +287,6 @@ def queue_browser_update():
             log_event("Injecting/updating chat observer with game commands...")
             driver.execute_script(MUTATION_OBSERVER_SCRIPT, ZWSP, SERVER_COMMAND_LIST, USER_COOLDOWN_SECONDS, SPAM_STRIKE_LIMIT, SPAM_TIMEOUT_SECONDS, SPAM_RESET_SECONDS)
 
-# --- MAIN BOT LOGIC (HEAVILY UPGRADED) ---
 def start_bot(use_key_login):
     global driver
     BOT_STATE["status"] = "Launching Browser..."; log_event("Performing full start...")
@@ -286,7 +297,6 @@ def start_bot(use_key_login):
         wait = WebDriverWait(driver, 15)
         
         try:
-            # Click through the initial notice popup if it exists
             btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".modal-container .btn-green")))
             driver.execute_script("arguments[0].click();", btn)
             logging.info("Clicked 'Accept' on notice.")
@@ -311,23 +321,19 @@ def start_bot(use_key_login):
             logging.warning("Login procedure timed out or elements not found. Assuming already in-game.")
             log_event("Login timeout; assuming in-game.")
         except InvalidKeyError as e:
-            raise e # Re-raise to be handled by the main loop
+            raise e
         except Exception as e:
             log_event(f"Login/entry sequence failed: {e}")
             raise e
 
-        # --- THE CRITICAL VERIFICATION STEP ---
         log_event("Waiting for game UI to be fully ready...")
         try:
-            WebDriverWait(driver, 60).until(
-                EC.presence_of_element_located((By.ID, "chat-input"))
-            )
+            WebDriverWait(driver, 60).until(EC.presence_of_element_located((By.ID, "chat-input")))
             log_event("✅ Game UI is ready. The bot can now see and hear.")
         except TimeoutException:
             log_event("CRITICAL: Game UI did not load within 60 seconds. The bot cannot continue.")
             raise RuntimeError("Timed out waiting for the main game interface to load.")
 
-        # Now that we know the page is ready, we can safely set up the command listener.
         log_event("Setting up the command listener...")
         if not fetch_command_list():
             raise RuntimeError("Could not load the internal command list.")
@@ -375,7 +381,6 @@ def start_bot(use_key_login):
             raise
         time.sleep(MAIN_LOOP_POLLING_INTERVAL_SECONDS)
 
-# --- MAIN EXECUTION (UPGRADED WITH RESTART LOGIC) ---
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=message_processor_thread, daemon=True).start()
