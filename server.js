@@ -1,12 +1,11 @@
 // server.js
 
 // --- CHANGE LOG ---
-// 1. FIXED: Tax income is now correctly calculated and added to the treasury each day.
-//    - The logic now uses `income_per_10_pop` from the `TAX_LEVELS` object.
-// 2. IMPLEMENTED: The Treasurer advisor's 10% tax bonus is now functional.
-//    - The tax income calculation checks if the treasurer is hired and applies the bonus.
-// 3. RESTRUCTURED: The daily upkeep logic in `requestNextChat` has been reordered
-//    and commented for better clarity (Income -> Expenses).
+// 1. ADDED: `flags` field to KingdomSchema to track long-term consequences of decisions.
+// 2. UPDATED: Reset logic in `createKingdom` and `handleConfirmation` now also clears flags.
+// 3. UPGRADED: `handleDecision` function now processes `random_outcomes` for events with chance-based results.
+// 4. UPGRADED: `handleDecision` can now set flags via `onSuccess` and clear them via `clearFlags` to manage event chains.
+// 5. IMPROVED: The status report in `handleDecision` is now more robust, showing all changes even from random outcomes.
 // --- END CHANGE LOG ---
 
 
@@ -33,6 +32,8 @@ const KingdomSchema = new mongoose.Schema({
     season: { type: String, default: 'Spring' },
     dayOfSeason: { type: Number, default: 1 },
     advisors: { type: Map, of: Boolean, default: () => new Map() },
+    // NEW: Flags to track story choices and unlock future events.
+    flags: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
@@ -89,9 +90,10 @@ async function createKingdom(playerName) {
         ];
     }
 
+    // UPDATED: Resetting the kingdom now also clears flags.
     await Kingdom.findByIdAndUpdate(playerName, {
         _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
-        taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), gameActive: true,
+        taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), flags: new Map(), gameActive: true,
         isAwaitingDecision: false, currentEventId: null, pendingAction: null
     }, { upsert: true, new: true });
 
@@ -110,6 +112,7 @@ async function handleConfirmation(playerName, choice) {
 
     if (action === 'confirm_reset') {
         if (choice === '!y') {
+            // UPDATED: Ensure flags are reset
             playerState.day = 0;
             playerState.treasury = 100;
             playerState.happiness = 50;
@@ -120,6 +123,7 @@ async function handleConfirmation(playerName, choice) {
             playerState.season = 'Spring';
             playerState.dayOfSeason = 1;
             playerState.advisors = new Map();
+            playerState.flags = new Map(); // Clear flags on reset
             playerState.gameActive = true;
             playerState.isAwaitingDecision = false;
             playerState.currentEventId = null;
@@ -143,8 +147,6 @@ async function destroyKingdom(playerName, reason) {
     return [`--- ${playerName}'s reign has ended after ${kingdom.day} days. ---`, `Reason: ${reason}`];
 }
 
-
-// --- FUNCTION WITH UPDATED TAX LOGIC ---
 async function requestNextChat(playerName) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to start.`];
@@ -154,14 +156,10 @@ async function requestNextChat(playerName) {
     const replies = [];
     const oldStats = { ...playerState.toObject() };
 
-    // --- Daily Time Progression ---
     playerState.day++;
     if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
     playerState.dayOfSeason++;
 
-    // --- Daily Upkeep & Income Calculations ---
-
-    // 1. Handle Season Change & Apply Daily Season Effects
     if (playerState.dayOfSeason > SEASON_LENGTH) {
         playerState.dayOfSeason = 1;
         const seasonNames = Object.keys(SEASONS);
@@ -171,21 +169,14 @@ async function requestNextChat(playerName) {
     const seasonEffect = SEASONS[playerState.season].effects;
     for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
-    // 2. Calculate and Apply Tax Effects (Income & Happiness) - THIS IS THE CORRECTED LOGIC
     const taxInfo = TAX_LEVELS[playerState.taxRate];
     if (taxInfo) {
-        // Calculate income, including the Treasurer's 10% bonus if hired
         const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
         const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
         playerState.treasury += taxIncome;
-
-        // Apply happiness effect
-        if (taxInfo.happiness_effect !== 0) {
-            playerState.happiness += taxInfo.happiness_effect;
-        }
+        if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
     }
 
-    // 3. Calculate and Apply Advisor Upkeep (Salaries & Passive Effects)
     let totalSalary = 0;
     if (playerState.advisors) {
         for (const [advisorKey, isHired] of playerState.advisors) {
@@ -200,7 +191,6 @@ async function requestNextChat(playerName) {
     }
     playerState.treasury -= totalSalary;
 
-    // --- Generate Reports & Check Game Over Conditions ---
     let upkeepReport = [];
     if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
     if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
@@ -215,7 +205,7 @@ async function requestNextChat(playerName) {
     }
     if (playerState.happiness <= 0) return destroyKingdom(playerName, "The people have revolted!");
 
-    // --- Select and Present a New Event ---
+    // The existing filtering logic naturally supports flags via the 'condition' function
     const availableEvents = allEvents.filter(e => {
         const condition = e.condition ? e.condition(playerState) : true;
         const seasonCondition = e.season ? e.season === playerState.season : true;
@@ -224,6 +214,7 @@ async function requestNextChat(playerName) {
         else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor);
         return condition && seasonCondition && advisorCondition;
     });
+
     const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)];
     if (!chosenEvent) {
         replies.push("The kingdom is quiet today. No one has come to petition the throne.");
@@ -243,7 +234,7 @@ async function requestNextChat(playerName) {
     return replies;
 }
 
-
+// --- UPGRADED FUNCTION to handle new event types ---
 async function handleDecision(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive || !playerState.isAwaitingDecision) return [];
@@ -256,25 +247,65 @@ async function handleDecision(playerName, choice) {
     const oldStats = { ...playerState.toObject() };
     const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
     const chosenOutcome = currentEvent[decisionKey];
+
+    const replies = [`${playerName}, ${chosenOutcome.text}`];
+
+    // --- NEW: Handle Random Outcomes ---
+    if (chosenOutcome.random_outcomes) {
+        const roll = Math.random();
+        let cumulativeChance = 0;
+        for (const outcome of chosenOutcome.random_outcomes) {
+            cumulativeChance += outcome.chance;
+            if (roll < cumulativeChance) {
+                // This is the chosen random outcome
+                replies.push(outcome.text);
+                if (outcome.effects) {
+                    for (const stat in outcome.effects) {
+                        if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat];
+                    }
+                }
+                break; // Stop after finding the outcome
+            }
+        }
+    }
+
+    // Apply standard effects
     if (chosenOutcome.effects) {
         for (const stat in chosenOutcome.effects) {
             if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat];
         }
     }
+    // Set/update flags or perform other special actions
     if (chosenOutcome.onSuccess) { chosenOutcome.onSuccess(playerState); }
+
+    // --- NEW: Clear flags after the event is done ---
+    if (chosenOutcome.clearFlags) {
+        chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
+    }
+
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
     await playerState.save();
-    const replies = [`${playerName}, ${chosenOutcome.text}`];
+
+    // --- IMPROVED: Generate a more robust status report ---
     let statusChanges = [];
-    if (chosenOutcome.effects) {
-        for (const stat in chosenOutcome.effects) {
-            if (oldStats.hasOwnProperty(stat)) statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
+    // Collect all possible stat keys that could have been affected
+    const allEffectKeys = Object.keys(chosenOutcome.effects || {});
+    if (chosenOutcome.random_outcomes) {
+        chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.push(k)));
+    }
+    const uniqueKeys = [...new Set(allEffectKeys)];
+
+    for (const stat of uniqueKeys) {
+        if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) {
+            statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
         }
     }
+
     if (statusChanges.length > 0) replies.push(statusChanges.join(' | '));
     return replies;
 }
+
 
 async function handleSetTax(playerName, newRate) {
     const playerState = await Kingdom.findById(playerName);
