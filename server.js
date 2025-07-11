@@ -1,18 +1,21 @@
 // server.js
 
 // --- CHANGE LOG ---
-// 1. BANKRUPTCY OVERHAUL: When treasury is <= 0, the game now searches for a special "last chance" event
-//    (like the Prince's loan offer) instead of ending immediately.
-// 2. NEW MECHANIC: `handleDecision` now understands the `triggersGameOver: true` flag from gameData.js,
-//    allowing specific choices to end the game.
-// 3. MINOR FIX: Corrected a typo in the `mongoose` require statement.
+// 1. PACING OVERHAUL: A "day" now consists of 3-10 events. Daily upkeep is only
+//    processed once all of the day's events are handled.
+// 2. COOLDOWN SYSTEM: Events now have a 30-day cooldown after they occur to prevent repetition.
+// 3. NEW SCHEMA FIELDS: Added `eventCooldowns`, `eventsToday`, and `eventIndex` to the
+//    KingdomSchema to manage the new pacing and cooldown systems.
+// 4. LOGIC OVERHAUL: `requestNextChat` and `handleDecision` have been significantly
+//    rewritten to support the new multi-event day loop.
+// 5. HELPER FUNCTION: Added `presentEvent` to reduce code duplication.
 // --- END CHANGE LOG ---
 
 
 // --- 1. SETUP & IMPORTS ---
 const express = require('express');
 const cors = require('cors');
-const mongoose = require('mongoose');
+const mongoose = 'mongoose';
 
 // Assuming gameData.js is in the same directory and is complete
 const {
@@ -33,9 +36,12 @@ const KingdomSchema = new mongoose.Schema({
     dayOfSeason: { type: Number, default: 1 },
     advisors: { type: Map, of: Boolean, default: () => new Map() },
     flags: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
-    eventCooldowns: { type: Map, of: Number, default: () => new Map() },
-    eventsToday: { type: [String], default: [] },
-    eventIndex: { type: Number, default: 0 },
+
+    // --- NEW FIELDS FOR PACING & COOLDOWNS ---
+    eventCooldowns: { type: Map, of: Number, default: () => new Map() }, // eventId -> day last seen
+    eventsToday: { type: [String], default: [] }, // A queue of event IDs for the current day
+    eventIndex: { type: Number, default: 0 }, // Which event in the queue we are on
+
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
@@ -154,6 +160,7 @@ async function requestNextChat(playerName) {
     if (playerState.isAwaitingDecision) return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
 
+    // Part 1: Check if there are still events left for the current day
     if (playerState.eventIndex < playerState.eventsToday.length) {
         const eventId = playerState.eventsToday[playerState.eventIndex];
         const event = eventsMap.get(eventId);
@@ -162,6 +169,7 @@ async function requestNextChat(playerName) {
         return replies;
     }
 
+    // Part 2: If not, the day is over. Process daily upkeep and start a new day.
     const replies = [];
     const oldStats = { ...playerState.toObject() };
 
@@ -199,6 +207,7 @@ async function requestNextChat(playerName) {
         if (upkeepReport.length > 0) replies.push(`--- End of Day ${playerState.day} Report ---\nDaily changes: ${upkeepReport.join(' | ')}`);
     }
 
+    // Advance time
     playerState.day++;
     playerState.dayOfSeason++;
     if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
@@ -209,22 +218,14 @@ async function requestNextChat(playerName) {
         replies.push(`A new season has begun: ${playerState.season}!`);
     }
 
-    if (playerState.treasury <= 0) {
-        const lastChanceEvent = allEvents.find(e =>
-            e.id === 'prince_loan_offer' &&
-            (!playerState.eventCooldowns.has(e.id) || playerState.day >= playerState.eventCooldowns.get(e.id) + EVENT_COOLDOWN_DAYS)
-        );
-
-        if (lastChanceEvent) {
-            const lastChanceReplies = presentEvent(playerState, lastChanceEvent, "A moment of desperation...");
-            await playerState.save();
-            return lastChanceReplies;
-        } else {
-            return destroyKingdom(playerName, "The kingdom is bankrupt with no hope of a loan!");
-        }
+    if (playerState.treasury < 0) return destroyKingdom(playerName, "The kingdom is bankrupt!");
+    if (playerState.happiness <= REVOLT_HAPPINESS_THRESHOLD && playerState.taxRate !== 'low') {
+        replies.push(`[!] WARNING: Happiness in ${playerName}'s kingdom is critically low!`);
+        playerState.happiness -= 2;
     }
     if (playerState.happiness <= 0) return destroyKingdom(playerName, "The people have revolted!");
 
+    // Part 3: Generate a new queue of events for the new day
     const numEventsForToday = Math.floor(Math.random() * (10 - 3 + 1)) + 3;
     const newEventQueue = [];
 
@@ -289,16 +290,12 @@ async function handleDecision(playerName, choice) {
         return ["An error occurred with your current event. Type !chat to continue."];
     }
     
-    const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
-    const chosenOutcome = currentEvent[decisionKey];
-    
-    if (chosenOutcome.triggersGameOver) {
-        return destroyKingdom(playerName, chosenOutcome.text);
-    }
-    
     playerState.eventCooldowns.set(playerState.currentEventId, playerState.day);
 
     const oldStats = { ...playerState.toObject() };
+    const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
+    const chosenOutcome = currentEvent[decisionKey];
+    
     const replies = [`${playerName}, ${chosenOutcome.text}`];
 
     if (chosenOutcome.random_outcomes) {
@@ -330,7 +327,7 @@ async function handleDecision(playerName, choice) {
 
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
-    playerData.eventIndex++;
+    playerState.eventIndex++;
 
     await playerState.save();
     
