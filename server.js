@@ -5,14 +5,14 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 
-// Import all game data from our new file
+// Assuming gameData.js is in the same directory and is complete
 const {
     TAX_LEVELS, REVOLT_HAPPINESS_THRESHOLD, SEASON_LENGTH, SEASONS, ADVISORS, allEvents, eventsMap
 } = require('./gameData');
 
 // --- 2. MONGOOSE SCHEMA DEFINITION ---
 const KingdomSchema = new mongoose.Schema({
-    _id: { type: String, required: true },
+    _id: { type: String, required: true }, // Player's name
     day: { type: Number, default: 0 },
     treasury: { type: Number, default: 100 },
     happiness: { type: Number, default: 50 },
@@ -25,7 +25,14 @@ const KingdomSchema = new mongoose.Schema({
     advisors: { type: Map, of: Boolean, default: {} },
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
-    currentEventId: { type: String, default: null }
+    currentEventId: { type: String, default: null },
+    pendingAction: { // The new field for confirmations
+        type: {
+            action: String, // e.g., 'confirm_reset'
+            expires: Date   // When the confirmation window closes
+        },
+        default: null
+    }
 });
 const Kingdom = mongoose.model('Kingdom', KingdomSchema);
 
@@ -45,15 +52,76 @@ mongoose.connect(MONGO_URI)
 
 
 // --- 4. CORE GAME LOGIC FUNCTIONS (ASYNC) ---
-// Note how clean these functions are now. They only contain logic, not data.
 
 async function createKingdom(playerName) {
+    const existingKingdom = await Kingdom.findById(playerName);
+
+    if (existingKingdom && existingKingdom.gameActive) {
+        // Kingdom exists, so start the confirmation process
+        const expirationTime = new Date(Date.now() + 30000); // 30-second window
+        existingKingdom.pendingAction = {
+            action: 'confirm_reset',
+            expires: expirationTime
+        };
+        await existingKingdom.save();
+
+        // Automatically cancel the action after 30 seconds
+        setTimeout(async () => {
+            const freshState = await Kingdom.findById(playerName);
+            if (freshState && freshState.pendingAction && freshState.pendingAction.action === 'confirm_reset' && new Date() > freshState.pendingAction.expires) {
+                freshState.pendingAction = null;
+                await freshState.save();
+            }
+        }, 31000); // Set slightly longer than the check to avoid race conditions
+
+        return [
+            `${playerName}, you already have a kingdom in progress.`,
+            `Are you sure you want to restart? This will ERASE your current game.`,
+            `Respond with !y (yes) or !n (no) within 30 seconds.`
+        ];
+    }
+
+    // No active kingdom exists, so create one immediately.
     await Kingdom.findByIdAndUpdate(playerName, {
         _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
         taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), gameActive: true,
-        isAwaitingDecision: false, currentEventId: null
+        isAwaitingDecision: false, currentEventId: null, pendingAction: null
     }, { upsert: true, new: true });
+
     return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
+}
+
+async function handleConfirmation(playerName, choice) {
+    const playerState = await Kingdom.findById(playerName);
+
+    if (!playerState || !playerState.pendingAction || new Date() > playerState.pendingAction.expires) {
+        return [`${playerName}, you have no pending action to confirm, or the confirmation window has expired.`];
+    }
+
+    const action = playerState.pendingAction.action;
+    playerState.pendingAction = null; // Clear the action immediately regardless of choice
+    await playerState.save();
+
+    if (action === 'confirm_reset') {
+        if (choice === '!y') {
+            // Player confirmed, now we can call the reset logic.
+            // We can reuse createKingdom. It will now find no active kingdom (since pendingAction is cleared) and proceed.
+            // A bit of a trick: we call it again, but this time the check at the top will fail.
+            const resetMessage = await createKingdom(playerName); // This will now go down the "create" path.
+            // We need to re-call the function, this time it will succeed
+             await Kingdom.findByIdAndUpdate(playerName, {
+                _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
+                taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), gameActive: true,
+                isAwaitingDecision: false, currentEventId: null, pendingAction: null
+            }, { upsert: true, new: true });
+
+            return [`${playerName}'s kingdom has been reset.`];
+
+        } else { // Handles !n
+            return [`${playerName}, restart cancelled. Your kingdom is safe.`];
+        }
+    }
+    return []; // Should not be reached
 }
 
 async function destroyKingdom(playerName, reason) {
@@ -65,11 +133,12 @@ async function destroyKingdom(playerName, reason) {
 }
 
 async function requestNextChat(playerName) {
-    let replies = [];
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to start.`];
     if (playerState.isAwaitingDecision) return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
+    if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
 
+    const replies = [];
     const oldStats = { ...playerState.toObject() };
     playerState.day++;
     if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
@@ -142,10 +211,11 @@ async function requestNextChat(playerName) {
 async function handleDecision(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive || !playerState.isAwaitingDecision) return [];
+    if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
     const currentEvent = eventsMap.get(playerState.currentEventId);
     if (!currentEvent) {
         playerState.isAwaitingDecision = false; await playerState.save();
-        return ["An error occurred. Type !chat to continue."];
+        return ["An error occurred with your current event. Type !chat to continue."];
     }
     const oldStats = { ...playerState.toObject() };
     const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
@@ -209,12 +279,12 @@ function showHelp() {
         "!kcreate: Create/restart your personal kingdom.",
         "!chat: Talk to the next person waiting. This moves time forward one day.",
         "!yes / !no: Respond to the person you're talking to.",
+        "!y / !n: Respond to a confirmation prompt.",
         "!status: Shows the full status of your kingdom.",
         "!settax [low|normal|high]: Sets your tax rate.",
         "!kdestroy: Abdicate the throne and end your game."
     ];
 }
-
 
 // --- 5. THE API ENDPOINT ---
 app.post('/command', async (req, res) => {
@@ -228,6 +298,8 @@ app.post('/command', async (req, res) => {
             case '!chat':       replies = await requestNextChat(playerName); break;
             case '!yes':
             case '!no':         replies = await handleDecision(playerName, command); break;
+            case '!y':
+            case '!n':          replies = await handleConfirmation(playerName, command); break;
             case '!status':     replies = await showStatus(playerName); break;
             case '!help':       replies = showHelp(); break;
             case '!settax':     replies = await handleSetTax(playerName, args[0]); break;
