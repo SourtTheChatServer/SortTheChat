@@ -1,158 +1,442 @@
-// gameData.js
+// server.js
 
 // --- CHANGE LOG ---
-// 1. ADDED: Four new user-requested event chains.
-//    - "The Grandma": A simple, low-stakes flavor event.
-//    - "The Prince of Almorg": A high-stakes loan and potential war. This introduces a "triggersGameOver" flag that will require a server.js update.
-//    - "The Devil": A classic moral dilemma with a dark twist.
-//    - "The Kid's Adventure": A two-part event with delayed, randomized rewards.
-// 2. All previous content (advisors, seasons, other events) remains intact.
+// 1. BANKRUPTCY OVERHAUL: When treasury is <= 0, the game now searches for a special "last chance" event
+//    (like the Prince's loan offer) instead of ending immediately.
+// 2. NEW MECHANIC: `handleDecision` now understands the `triggersGameOver: true` flag from gameData.js,
+//    allowing specific choices to end the game.
+// 3. MINOR FIX: Corrected a typo in the `mongoose` require statement.
 // --- END CHANGE LOG ---
 
 
-const TAX_LEVELS = {
-    'low': { income_per_10_pop: 0.5, happiness_effect: +1, label: "Low" },
-    'normal': { income_per_10_pop: 1.0, happiness_effect: 0, label: "Normal" },
-    'high': { income_per_10_pop: 1.5, happiness_effect: -2, label: "High" }
-};
+// --- 1. SETUP & IMPORTS ---
+const express = require('express');
+const cors = require('cors');
+const mongoose = require('mongoose');
 
-const HAPPINESS_BASELINE = 50;
-const HAPPINESS_MODIFIER_STRENGTH = 0.5;
-const REVOLT_HAPPINESS_THRESHOLD = 20;
+// Assuming gameData.js is in the same directory and is complete
+const {
+    TAX_LEVELS, REVOLT_HAPPINESS_THRESHOLD, SEASON_LENGTH, SEASONS, ADVISORS, allEvents, eventsMap, EVENT_COOLDOWN_DAYS
+} = require('./gameData');
 
-const SEASON_LENGTH = 20;
-const SEASONS = {
-    'Spring': { icon: '🌸', effects: { population: +1 } },
-    'Summer': { icon: '☀️', effects: { happiness: +1 } },
-    'Autumn': { icon: '🍂', effects: { treasury: +2 } },
-    'Winter': { icon: '❄️', effects: { happiness: -1 } }
-};
-
-const ADVISORS = {
-    'general': { name: "General Kael", upkeep: { salary: 5, effects: { military: +1 } } },
-    'treasurer': { name: "Lady Elara", upkeep: { salary: 8 } },
-    'spymaster': { name: "The Whisper", upkeep: { salary: 10, effects: { happiness: -1 } } }
-};
-
-const EVENT_COOLDOWN_DAYS = 30;
-
-const allEvents = [
-    // --- NEW User-Requested Events ---
-    {
-        id: 'grandma_coffee',
-        petitioner: "An Old Grandma",
-        text: "Oh, dearie. I'd love a nice cup of coffee from the tavern, but I'm just a few coins short. Could you spare a bit of gold for an old woman?",
-        onYes: { text: "She blesses you with a warm smile. The tavern patrons notice your kindness.", effects: { treasury: -3, happiness: +3 } },
-        onNo: { text: "She shuffles away sadly. It was only a few coins.", effects: {} }
-    },
-    {
-        // NOTE: This event is special. server.js will be updated to trigger this INSTEAD of a "bankrupt" game over.
-        id: 'prince_loan_offer',
-        petitioner: "The Smug Prince of Almorg",
-        text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 100 gold. I'll return for it in 10 days, of course.",
-        condition: (gs) => gs.treasury <= 0, // This is the trigger
-        onYes: { text: "He smirks. 'A pleasure doing business.' Your kingdom is saved, for now.", effects: { treasury: +100 }, onSuccess: (gs) => { gs.flags.set('loan_from_prince', gs.day); } },
-        onNo: { text: "You refuse his charity. With no funds and no prospects, your kingdom collapses into chaos.", triggersGameOver: true } // New flag for server.js
-    },
-    {
-        id: 'prince_loan_collection',
-        petitioner: "The Smug Prince of Almorg",
-        text: "I've returned as promised for my 100 gold. I trust it's ready?",
-        condition: (gs) => gs.flags.has('loan_from_prince') && gs.day >= gs.flags.get('loan_from_prince') + 10,
-        onYes: { text: "He counts the coins and nods. 'Until next time.' The debt is settled.", effects: { treasury: -100 }, clearFlags: ['loan_from_prince'] },
-        onNo: {
-            text: "You refuse to pay. This is an act of war! His army marches on your kingdom.",
-            clearFlags: ['loan_from_prince'],
-            // The outcome of the war is a matter of luck in this version. Your military strength matters for other things!
-            random_outcomes: [
-                { chance: 0.5, text: "Against the odds, your forces claim a stunning victory! The debt is erased by the sword.", effects: { military: -10, happiness: +20 } },
-                { chance: 0.5, text: "His professional army crushes yours. Your defeat is swift and humiliating.", effects: { military: -20, population: -15, happiness: -25, treasury: -50 } }
-            ]
-        }
-    },
-    {
-        id: 'devil_bargain',
-        petitioner: "A handsome, well-dressed man",
-        text: "Greetings. I represent a foreign power with vast resources. I can solve your financial woes instantly. All I ask for is a small tithe of your population. Say, 10 souls?",
-        onYes: { text: "He smiles, and it doesn't reach his eyes. 'The payment has been collected.'", effects: { population: -10, treasury: +200, happiness: -25 } },
-        onNo: { text: "He vanishes in a puff of smoke. Your moral clarity inspires your people.", effects: { happiness: +5, population: +5 } }
-    },
-    {
-        id: 'kid_adventure_start',
-        petitioner: "An Eager-Eyed Kid",
-        text: "Your Majesty! I'm going on a grand adventure! I just need a bit of funding... and maybe a few guards to carry my stuff. Please?",
-        condition: (gs) => gs.treasury >= 25 && gs.military >= 10,
-        onYes: { text: "He cheers and runs off, the guards struggling to keep up. Your people are charmed.", effects: { treasury: -25, military: -10, happiness: +5 }, onSuccess: (gs) => { gs.flags.set('kid_on_adventure', gs.day); } },
-        onNo: { text: "The kid's face falls. He kicks a rock and trudges away.", effects: { happiness: -10 } }
-    },
-    {
-        id: 'kid_adventure_return',
-        petitioner: "The Guard Captain",
-        text: "He's back! The kid has returned from his adventure, looking muddy but triumphant. Shall we see what he found?",
-        condition: (gs) => gs.flags.has('kid_on_adventure') && gs.day >= gs.flags.get('kid_on_adventure') + 3,
-        // Both choices lead to the same outcome: the random reward.
-        onYes: {
-            text: "You welcome the young hero back!",
-            effects: { military: +10 }, // The guards return
-            clearFlags: ['kid_on_adventure'],
-            random_outcomes: [
-                { chance: 0.05, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
-                { chance: 0.25, text: "He stumbled upon a goblin treasure hoard!", effects: { treasury: +200 } },
-                { chance: 0.50, text: "He found a lost merchant's purse on the road.", effects: { treasury: +50 } },
-                { chance: 0.20, text: "He proudly presents you with a... weirdly shaped rock.", effects: { treasury: +1 } }
-            ]
+// --- 2. MONGOOSE SCHEMA DEFINITION ---
+const KingdomSchema = new mongoose.Schema({
+    _id: { type: String, required: true },
+    day: { type: Number, default: 0 },
+    treasury: { type: Number, default: 100 },
+    happiness: { type: Number, default: 50 },
+    population: { type: Number, default: 100 },
+    military: { type: Number, default: 10 },
+    taxRate: { type: String, default: 'normal' },
+    taxChangeCooldown: { type: Number, default: 0 },
+    season: { type: String, default: 'Spring' },
+    dayOfSeason: { type: Number, default: 1 },
+    advisors: { type: Map, of: Boolean, default: () => new Map() },
+    flags: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
+    eventCooldowns: { type: Map, of: Number, default: () => new Map() },
+    eventsToday: { type: [String], default: [] },
+    eventIndex: { type: Number, default: 0 },
+    gameActive: { type: Boolean, default: true },
+    isAwaitingDecision: { type: Boolean, default: false },
+    currentEventId: { type: String, default: null },
+    pendingAction: {
+        type: {
+            action: String,
+            expires: Date
         },
-        onNo: { // The 'no' choice is just flavor text, the outcome is identical.
-            text: "You greet the returning adventurer.",
-            effects: { military: +10 },
-            clearFlags: ['kid_on_adventure'],
-            random_outcomes: [
-                { chance: 0.05, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
-                { chance: 0.25, text: "He stumbled upon a goblin treasure hoard!", effects: { treasury: +200 } },
-                { chance: 0.50, text: "He found a lost merchant's purse on the road.", effects: { treasury: +50 } },
-                { chance: 0.20, text: "He proudly presents you with a... weirdly shaped rock.", effects: { treasury: +1 } }
-            ]
+        default: null
+    }
+});
+const Kingdom = mongoose.model('Kingdom', KingdomSchema);
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// --- 3. DATABASE CONNECTION ---
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+    console.error("FATAL ERROR: MONGO_URI environment variable is not set.");
+    process.exit(1);
+}
+mongoose.connect(MONGO_URI)
+    .then(() => console.log("MongoDB connected successfully."))
+    .catch(err => console.error("MongoDB connection error:", err));
+
+
+// --- 4. CORE GAME LOGIC FUNCTIONS (ASYNC) ---
+
+async function createKingdom(playerName) {
+    const existingKingdom = await Kingdom.findById(playerName);
+
+    if (existingKingdom && existingKingdom.gameActive) {
+        const expirationTime = new Date(Date.now() + 30000);
+        existingKingdom.pendingAction = { action: 'confirm_reset', expires: expirationTime };
+        await existingKingdom.save();
+
+        setTimeout(async () => {
+            const freshState = await Kingdom.findById(playerName);
+            if (freshState && freshState.pendingAction && freshState.pendingAction.action === 'confirm_reset' && new Date() > freshState.pendingAction.expires) {
+                freshState.pendingAction = null;
+                await freshState.save();
+            }
+        }, 31000);
+
+        return [
+            `${playerName}, you already have a kingdom in progress.`,
+            `Are you sure you want to restart? This will ERASE your current game.`,
+            `Respond with !y (yes) or !n (no) within 30 seconds.`
+        ];
+    }
+
+    await Kingdom.findByIdAndUpdate(playerName, {
+        _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
+        taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), flags: new Map(),
+        eventCooldowns: new Map(), eventsToday: [], eventIndex: 0,
+        gameActive: true, isAwaitingDecision: false, currentEventId: null, pendingAction: null
+    }, { upsert: true, new: true });
+
+    return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
+}
+
+async function handleConfirmation(playerName, choice) {
+    const playerState = await Kingdom.findById(playerName);
+
+    if (!playerState || !playerState.pendingAction || new Date() > playerState.pendingAction.expires) {
+        return [`${playerName}, you have no pending action to confirm, or the confirmation window has expired.`];
+    }
+
+    const action = playerState.pendingAction.action;
+    playerState.pendingAction = null;
+
+    if (action === 'confirm_reset') {
+        if (choice === '!y') {
+            playerState.day = 0;
+            playerState.treasury = 100;
+            playerState.happiness = 50;
+            playerState.population = 100;
+            playerState.military = 10;
+            playerState.taxRate = 'normal';
+            playerState.taxChangeCooldown = 0;
+            playerState.season = 'Spring';
+            playerState.dayOfSeason = 1;
+            playerState.advisors = new Map();
+            playerState.flags = new Map();
+            playerState.eventCooldowns = new Map();
+            playerState.eventsToday = [];
+            playerState.eventIndex = 0;
+            playerState.gameActive = true;
+            playerState.isAwaitingDecision = false;
+            playerState.currentEventId = null;
+
+            await playerState.save();
+            return [`${playerName}'s kingdom has been reset.`];
+        } else {
+            await playerState.save();
+            return [`${playerName}, restart cancelled. Your kingdom is safe.`];
         }
-    },
+    }
+    await playerState.save();
+    return [];
+}
 
-    // --- Advisor Events ---
-    { id: 'recruit_general', petitioner: "A battle-scarred soldier", text: "My liege, our army is disorganized. For a salary, the legendary General Kael could lead our troops.", requiresNoAdvisor: 'general', onYes: { text: "General Kael accepts your offer.", effects: { military: +10 }, onSuccess: (gs) => { gs.advisors.set('general', true); } }, onNo: { text: "You decline. The army remains a rudderless ship.", effects: { happiness: -5 } } },
-    { id: 'recruit_treasurer', petitioner: "A guild merchant", text: "Your Majesty, the economy is a tangled mess. Lady Elara's services are costly, but she can make tax collection 10% more effective.", requiresNoAdvisor: 'treasurer', condition: (gs) => gs.treasury > 200, onYes: { text: "Lady Elara joins your council.", effects: {}, onSuccess: (gs) => { gs.advisors.set('treasurer', true); } }, onNo: { text: "You decide your current methods are sufficient.", effects: {} } },
-    { id: 'recruit_spymaster', petitioner: "A cloaked figure", text: "Knowledge is power, your Majesty. Secrets are a weapon. I can be your weapon... for a price.", requiresNoAdvisor: 'spymaster', onYes: { text: "The figure nods. 'My whispers will serve you.'", effects: {}, onSuccess: (gs) => { gs.advisors.set('spymaster', true); } }, onNo: { text: "The figure melts back into the shadows.", effects: {} } },
-    { id: 'general_report', advisor: 'general', petitioner: () => ADVISORS.general.name, text: (gs) => `My liege, our military strength is ${gs.military}. I request 50 gold for training exercises.`, onYes: { text: "The training exercises are a success!", effects: { treasury: -50, military: +15 } }, onNo: { text: "'As you command,' the General says, disappointed.", effects: { happiness: -5 } } },
-    { id: 'spymaster_report', advisor: 'spymaster', petitioner: () => ADVISORS.spymaster.name, text: "A whisper... A noble family plots against you. For 25 gold, I can... 'discourage' them.", onYes: { text: "The problem is dealt with. The nobles are suddenly very loyal.", effects: { treasury: -25, happiness: +10 } }, onNo: { text: "You let them be. Dissent grows.", effects: { happiness: -15 } } },
+async function destroyKingdom(playerName, reason) {
+    const kingdom = await Kingdom.findById(playerName);
+    if (!kingdom || !kingdom.gameActive) return [];
+    kingdom.gameActive = false;
+    await kingdom.save();
+    return [`--- ${playerName}'s reign has ended after ${kingdom.day} days. ---`, `Reason: ${reason}`];
+}
+
+async function requestNextChat(playerName) {
+    const playerState = await Kingdom.findById(playerName);
+    if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to start.`];
+    if (playerState.isAwaitingDecision) return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
+    if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
+
+    if (playerState.eventIndex < playerState.eventsToday.length) {
+        const eventId = playerState.eventsToday[playerState.eventIndex];
+        const event = eventsMap.get(eventId);
+        const replies = presentEvent(playerState, event, `Petitioner ${playerState.eventIndex + 1} of ${playerState.eventsToday.length} for today.`);
+        await playerState.save();
+        return replies;
+    }
+
+    const replies = [];
+    const oldStats = { ...playerState.toObject() };
+
+    if (playerState.day > 0) {
+        const seasonEffect = SEASONS[playerState.season].effects;
+        for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
+
+        const taxInfo = TAX_LEVELS[playerState.taxRate];
+        if (taxInfo) {
+            const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
+            const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
+            playerState.treasury += taxIncome;
+            if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
+        }
+
+        let totalSalary = 0;
+        if (playerState.advisors) {
+            for (const [advisorKey, isHired] of playerState.advisors) {
+                if (isHired) {
+                    const advisor = ADVISORS[advisorKey];
+                    if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary;
+                    if (advisor.upkeep.effects) {
+                        for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat];
+                    }
+                }
+            }
+        }
+        playerState.treasury -= totalSalary;
+        
+        let upkeepReport = [];
+        if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
+        if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
+        if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
+        if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
+        if (upkeepReport.length > 0) replies.push(`--- End of Day ${playerState.day} Report ---\nDaily changes: ${upkeepReport.join(' | ')}`);
+    }
+
+    playerState.day++;
+    playerState.dayOfSeason++;
+    if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
+    if (playerState.dayOfSeason > SEASON_LENGTH) {
+        playerState.dayOfSeason = 1;
+        const seasonNames = Object.keys(SEASONS);
+        playerState.season = seasonNames[(seasonNames.indexOf(playerState.season) + 1) % seasonNames.length];
+        replies.push(`A new season has begun: ${playerState.season}!`);
+    }
+
+    if (playerState.treasury <= 0) {
+        const lastChanceEvent = allEvents.find(e =>
+            e.id === 'prince_loan_offer' &&
+            (!playerState.eventCooldowns.has(e.id) || playerState.day >= playerState.eventCooldowns.get(e.id) + EVENT_COOLDOWN_DAYS)
+        );
+
+        if (lastChanceEvent) {
+            const lastChanceReplies = presentEvent(playerState, lastChanceEvent, "A moment of desperation...");
+            await playerState.save();
+            return lastChanceReplies;
+        } else {
+            return destroyKingdom(playerName, "The kingdom is bankrupt with no hope of a loan!");
+        }
+    }
+    if (playerState.happiness <= 0) return destroyKingdom(playerName, "The people have revolted!");
+
+    const numEventsForToday = Math.floor(Math.random() * (10 - 3 + 1)) + 3;
+    const newEventQueue = [];
+
+    let availableEvents = allEvents.filter(e => {
+        const lastSeen = playerState.eventCooldowns.get(e.id);
+        if (lastSeen && playerState.day < lastSeen + EVENT_COOLDOWN_DAYS) return false;
+
+        const condition = e.condition ? e.condition(playerState) : true;
+        const seasonCondition = e.season ? e.season === playerState.season : true;
+        let advisorCondition = true;
+        if (e.advisor) advisorCondition = playerState.advisors.get(e.advisor);
+        else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor);
+        return condition && seasonCondition && advisorCondition;
+    });
+
+    for (let i = 0; i < numEventsForToday; i++) {
+        if (availableEvents.length === 0) break;
+        const eventIndex = Math.floor(Math.random() * availableEvents.length);
+        const chosenEvent = availableEvents[eventIndex];
+        newEventQueue.push(chosenEvent.id);
+        availableEvents.splice(eventIndex, 1);
+    }
     
-    // --- Other Chained & Standard Events ---
-    { id: 'farmer_blight', petitioner: "A Farmer", text: "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds.", onYes: { text: "The farmers are grateful! They promise to remember your generosity.", effects: { treasury: -50, happiness: +15 }, onSuccess: (gs) => { gs.flags.set('helped_farmer_blight', gs.day); } }, onNo: { text: "The farmers despair.", effects: { happiness: -15, population: -10 } } },
-    { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
-    { id: 'shady_merchant', petitioner: "A Shady Merchant", text: "Psst... a small investment of 20 gold could double your return!", onYes: { text: "The gamble pays off!", effects: { treasury: +20 }, onSuccess: (gs) => { gs.flags.set('trusted_shady_merchant', true); } }, onNo: { text: "You wisely refuse.", effects: { happiness: +5 } } },
-    { id: 'shady_merchant_big_deal', petitioner: "The Shady Merchant", text: "You trusted me once, and it paid off! Now for a *real* opportunity. An overseas venture. It requires 200 gold. Are you in?", condition: (gs) => gs.flags.has('trusted_shady_merchant') && gs.treasury >= 200, onYes: { text: "You hand over the coin pouch... the merchant scurries away.", effects: { treasury: -200 }, clearFlags: ['trusted_shady_merchant'], random_outcomes: [ { chance: 0.5, text: "He returns with a chest of foreign silks! The investment was a massive success!", effects: { treasury: +500 } }, { chance: 0.5, text: "You never see him again. You've been had.", effects: { happiness: -20 } } ] }, onNo: { text: "You decide not to press your luck. The merchant shrugs and disappears.", effects: {}, clearFlags: ['trusted_shady_merchant'] } },
-    { id: 'alchemist_offer', petitioner: "An Eccentric Alchemist", text: "Behold! My 'Elixir of Fortitude'! For just 40 gold, I can supply it to your guards. Their resolve will be unbreakable!", condition: (gs) => gs.military > 15, onYes: { text: "The alchemist mixes a bubbling green potion for the guards.", effects: { treasury: -40, military: +10, happiness: -5 } }, onNo: { text: "'Your loss!' the alchemist mutters, storming off.", effects: {} } },
-    { id: 'inventor_proposal', petitioner: "A Pragmatic Inventor", text: "Your Majesty, I have designed a new type of plow that could revolutionize our farming. I need 100 gold to build the prototypes.", condition: (gs) => gs.population > 120, onYes: { text: "The investment pays off! Food production increases.", effects: { treasury: -100, population: +15 } }, onNo: { text: "The inventor sadly packs up her blueprints and seeks a more forward-thinking patron.", effects: { happiness: -5 } } },
-    { id: 'border_dispute', petitioner: "A Stressed Diplomat", text: "A dispute has arisen with a neighboring kingdom over border territories. We can press our claim with military might, or seek a peaceful resolution.", condition: (gs) => gs.day > 50, onYes: { text: "You send a detachment of soldiers to secure the border. The neighbor backs down, for now.", effects: { military: +5, happiness: -5 } }, onNo: { text: "You cede the disputed land to maintain peace. Your neighbor is pleased, but some of your people see it as weakness.", effects: { treasury: +20, happiness: -10 } } },
-    { id: 'traveling_circus', petitioner: "A Traveling Circus", text: "For 30 gold, our circus will perform and lift the spirits of your citizens!", onYes: { text: "The circus is a hit!", effects: { treasury: -30, happiness: +25 } }, onNo: { text: "The circus packs up and leaves.", effects: { happiness: -5 } } },
-    { id: 'goblin_raid', petitioner: "A Scout", text: (gs) => `Goblins are raiding the western farms! Our military strength is only ${gs.military}!`, condition: (gs) => gs.military < 30, onYes: { text: "The guards repel the goblins, but take some losses.", effects: { military: -5, happiness: +10, treasury: -10 } }, onNo: { text: "The goblins raid several farms before retreating.", effects: { happiness: -15, population: -10, treasury: -20 } } },
-    { id: 'migrant_group', petitioner: "The Guard Captain", text: "A group of 20 migrants has arrived at the gates, seeking refuge.", onYes: { text: "You welcome them. They are hardworking and grateful.", effects: { population: +20, happiness: +5 } }, onNo: { text: "You turn the migrants away.", effects: { happiness: -10 } } },
+    playerState.eventsToday = newEventQueue;
+    playerState.eventIndex = 0;
+
+    if (playerState.eventsToday.length === 0) {
+        replies.push(`--- Day ${playerState.day} ---`, "The kingdom is quiet today. No one has come to petition the throne.");
+        await playerState.save();
+        return replies;
+    }
+
+    const firstEvent = eventsMap.get(playerState.eventsToday[0]);
+    replies.push(...presentEvent(playerState, firstEvent, `A new day begins! Petitioner 1 of ${playerState.eventsToday.length}.`));
+    await playerState.save();
+    return replies;
+}
+
+function presentEvent(playerState, event, dayStatus) {
+    playerState.currentEventId = event.id;
+    playerState.isAwaitingDecision = true;
     
-    // --- Seasonal Events ---
-    { id: 'spring_festival', season: 'Spring', petitioner: "A Cheerful Villager", text: "Let's celebrate the end of winter with a grand Spring Festival! It will cost 40 gold.", onYes: { text: "The festival is a joyous success!", effects: { treasury: -40, happiness: +25 } }, onNo: { text: "You cancel the festival.", effects: { happiness: -10 } } },
-    { id: 'summer_drought', season: 'Summer', petitioner: "A Worried Farmer", text: "There has been no rain for weeks! Our crops are withering. We need 50 gold for irrigation.", onYes: { text: "The irrigation effort saves the harvest!", effects: { treasury: -50, population: +5 } }, onNo: { text: "The crops fail under the blazing sun.", effects: { happiness: -10, population: -10 } } },
-    { id: 'autumn_harvest_bonus', season: 'Autumn', petitioner: "The Royal Treasurer", text: "My liege, the autumn harvest has been exceptionally bountiful! We have a surplus of 100 gold.", onYes: { text: "You order a feast to celebrate!", effects: { treasury: +50, happiness: +10 } }, onNo: { text: "You wisely store the entire surplus.", effects: { treasury: +100, happiness: -5 } } },
-    { id: 'winter_blizzard', season: 'Winter', petitioner: "The Guard Captain", text: "A fierce blizzard has buried the kingdom in snow! We need 70 gold for a relief effort.", onYes: { text: "The relief effort is a success!", effects: { treasury: -70, happiness: +20, population: +5 } }, onNo: { text: "The kingdom remains paralyzed. Some do not survive the cold.", effects: { happiness: -20, population: -15 } } },
-];
+    const petitioner = typeof event.petitioner === 'function' ? event.petitioner() : event.petitioner;
+    const eventText = typeof event.text === 'function' ? event.text(playerState) : event.text;
 
-const eventsMap = new Map(allEvents.map(e => [e.id, e]));
+    return [
+        `--- ${playerState._id}'s Kingdom, Day ${playerState.day} ---`,
+        `(${dayStatus})`,
+        `${petitioner} wants to talk.`,
+        `"${eventText}"`,
+        "What do you say? (!yes / !no)"
+    ];
+}
 
-// Export everything so server.js can use it
-module.exports = {
-    TAX_LEVELS,
-    HAPPINESS_BASELINE,
-    HAPPINESS_MODIFIER_STRENGTH,
-    REVOLT_HAPPINESS_THRESHOLD,
-    SEASON_LENGTH,
-    SEASONS,
-    ADVISORS,
-    EVENT_COOLDOWN_DAYS,
-    allEvents,
-    eventsMap
-};
+async function handleDecision(playerName, choice) {
+    const playerState = await Kingdom.findById(playerName);
+    if (!playerState || !playerState.gameActive || !playerState.isAwaitingDecision) return [];
+    if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
+    const currentEvent = eventsMap.get(playerState.currentEventId);
+    if (!currentEvent) {
+        playerState.isAwaitingDecision = false; await playerState.save();
+        return ["An error occurred with your current event. Type !chat to continue."];
+    }
+    
+    const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
+    const chosenOutcome = currentEvent[decisionKey];
+    
+    if (chosenOutcome.triggersGameOver) {
+        return destroyKingdom(playerName, chosenOutcome.text);
+    }
+    
+    playerState.eventCooldowns.set(playerState.currentEventId, playerState.day);
+
+    const oldStats = { ...playerState.toObject() };
+    const replies = [`${playerName}, ${chosenOutcome.text}`];
+
+    if (chosenOutcome.random_outcomes) {
+        const roll = Math.random();
+        let cumulativeChance = 0;
+        for (const outcome of chosenOutcome.random_outcomes) {
+            cumulativeChance += outcome.chance;
+            if (roll < cumulativeChance) {
+                replies.push(outcome.text);
+                if (outcome.effects) {
+                    for (const stat in outcome.effects) {
+                        if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat];
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if (chosenOutcome.effects) {
+        for (const stat in chosenOutcome.effects) {
+            if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat];
+        }
+    }
+    if (chosenOutcome.onSuccess) { chosenOutcome.onSuccess(playerState); }
+    if (chosenOutcome.clearFlags) {
+        chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
+    }
+
+    playerState.isAwaitingDecision = false;
+    playerState.currentEventId = null;
+    playerData.eventIndex++;
+
+    await playerState.save();
+    
+    let statusChanges = [];
+    const allEffectKeys = Object.keys(chosenOutcome.effects || {});
+    if (chosenOutcome.random_outcomes) {
+        chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.push(k)));
+    }
+    const uniqueKeys = [...new Set(allEffectKeys)];
+    for (const stat of uniqueKeys) {
+        if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) {
+            statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
+        }
+    }
+    if (statusChanges.length > 0) replies.push(statusChanges.join(' | '));
+
+    if (playerState.eventIndex < playerState.eventsToday.length) {
+        replies.push("Type !chat to speak to the next petitioner.");
+    } else {
+        replies.push("You have seen everyone for today. Type !chat to start the next day.");
+    }
+    return replies;
+}
+
+async function handleSetTax(playerName, newRate) {
+    const playerState = await Kingdom.findById(playerName);
+    if (!playerState || !playerState.gameActive) return [];
+    if (!newRate || !TAX_LEVELS[newRate]) return [`${playerName}, invalid tax rate. Choose from: low, normal, high.`];
+    if (playerState.taxRate === newRate) return [`${playerName}, your tax rate is already ${newRate}.`];
+    if (playerState.taxChangeCooldown > 0) return [`${playerName}, you can't change taxes for ${playerState.taxChangeCooldown} more day(s).`];
+    playerState.taxRate = newRate;
+    playerState.taxChangeCooldown = 3;
+    await playerState.save();
+    return [`${playerName}, your kingdom's tax rate is now ${TAX_LEVELS[newRate].label}.`];
+}
+
+function formatStatChange(stat, oldValue, newValue) {
+    const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '🛡️' };
+    return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
+}
+
+async function showStatus(playerName) {
+    const playerState = await Kingdom.findById(playerName);
+    if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to begin.`];
+    let advisorList = 'None';
+    if (playerState.advisors && playerState.advisors.size > 0) {
+        const hiredAdvisors = [];
+        for (const [key, isHired] of playerState.advisors.entries()) {
+            if (isHired) {
+                hiredAdvisors.push(ADVISORS[key].name);
+            }
+        }
+        if (hiredAdvisors.length > 0) {
+            advisorList = hiredAdvisors.join(', ');
+        }
+    }
+    return [
+        `--- ${playerName}'s Kingdom Status (Day ${playerState.day}) ---`,
+        `💰 Treasury: ${playerState.treasury}`, `😊 Happiness: ${playerState.happiness}`,
+        `👨‍👩‍👧‍👦 Population: ${playerState.population}`, `🛡️ Military: ${playerState.military}`,
+        `⚖️ Tax Rate: ${TAX_LEVELS[playerState.taxRate].label}`, `🌸 Season: ${playerState.season}`,
+        `👑 Council: ${advisorList}`
+    ];
+}
+
+function showHelp() {
+    return [
+        "--- Kingdom Chat Help ---",
+        "!kcreate: Create/restart your personal kingdom.",
+        "!chat: Talk to the next person waiting. This moves time forward one day.",
+        "!yes / !no: Respond to the person you're talking to.",
+        "!y / !n: Respond to a confirmation prompt.",
+        "!status: Shows the full status of your kingdom.",
+        "!settax [low|normal|high]: Sets your tax rate.",
+        "!kdestroy: Abdicate the throne and end your game."
+    ];
+}
+
+// --- 5. THE API ENDPOINT ---
+app.post('/command', async (req, res) => {
+    const { playerName, command, args } = req.body;
+    if (!playerName || !command) return res.status(400).json({ error: "Missing playerName or command" });
+    let replies = [];
+    try {
+        switch (command) {
+            case '!kcreate':    replies = await createKingdom(playerName); break;
+            case '!kdestroy':   replies = await destroyKingdom(playerName, "You have abdicated the throne."); break;
+            case '!chat':       replies = await requestNextChat(playerName); break;
+            case '!yes':
+            case '!no':         replies = await handleDecision(playerName, command); break;
+            case '!y':
+            case '!n':          replies = await handleConfirmation(playerName, command); break;
+            case '!status':     replies = await showStatus(playerName); break;
+            case '!help':       replies = showHelp(); break;
+            case '!settax':     replies = await handleSetTax(playerName, args[0]); break;
+            default: break;
+        }
+    } catch (error) {
+        console.error("Error processing command:", error);
+        replies = ["A critical server error occurred."];
+    }
+    res.json({ replies });
+});
+
+// --- 6. SERVER STARTUP ---
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Kingdom Chat server (Advanced) listening on port ${PORT}`);
+});
