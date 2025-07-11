@@ -1,12 +1,12 @@
 // gameData.js
 
 // --- CHANGE LOG ---
-// 1. ADDED: Four new user-requested event chains.
-//    - "The Grandma": A simple, low-stakes flavor event.
-//    - "The Prince of Almorg": A high-stakes loan and potential war. This introduces a "triggersGameOver" flag that will require a server.js update.
-//    - "The Devil": A classic moral dilemma with a dark twist.
-//    - "The Kid's Adventure": A two-part event with delayed, randomized rewards.
-// 2. All previous content (advisors, seasons, other events) remains intact.
+// 1. UPDATED: "The Prince of Almorg" event chain.
+//    - Loan amount increased from 100 to 500 gold.
+//    - A new flag, 'prince_is_enemy', is now used.
+//    - Repaying the loan peacefully allows the prince to offer help again in the future.
+//    - Refusing to repay and fighting the prince sets the 'prince_is_enemy' flag, permanently cutting off future aid from him.
+// 2. All other content remains the same.
 // --- END CHANGE LOG ---
 
 
@@ -37,7 +37,7 @@ const ADVISORS = {
 const EVENT_COOLDOWN_DAYS = 30;
 
 const allEvents = [
-    // --- NEW User-Requested Events ---
+    // --- User-Requested Events ---
     {
         id: 'grandma_coffee',
         petitioner: "An Old Grandma",
@@ -46,24 +46,33 @@ const allEvents = [
         onNo: { text: "She shuffles away sadly. It was only a few coins.", effects: {} }
     },
     {
-        // NOTE: This event is special. server.js will be updated to trigger this INSTEAD of a "bankrupt" game over.
+        // *** MODIFIED EVENT ***
         id: 'prince_loan_offer',
         petitioner: "The Smug Prince of Almorg",
-        text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 100 gold. I'll return for it in 10 days, of course.",
-        condition: (gs) => gs.treasury <= 0, // This is the trigger
-        onYes: { text: "He smirks. 'A pleasure doing business.' Your kingdom is saved, for now.", effects: { treasury: +100 }, onSuccess: (gs) => { gs.flags.set('loan_from_prince', gs.day); } },
-        onNo: { text: "You refuse his charity. With no funds and no prospects, your kingdom collapses into chaos.", triggersGameOver: true } // New flag for server.js
+        text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 500 gold. I'll return for it in 10 days, of course.",
+        condition: (gs) => gs.treasury <= 0 && !gs.flags.has('prince_is_enemy'),
+        onYes: {
+            text: "He smirks. 'A pleasure doing business.' Your kingdom is saved, for now.",
+            effects: { treasury: +500 },
+            onSuccess: (gs) => { gs.flags.set('loan_from_prince', gs.day); }
+        },
+        onNo: { text: "You refuse his charity. With no funds and no prospects, your kingdom collapses into chaos.", triggersGameOver: true }
     },
     {
+        // *** MODIFIED EVENT ***
         id: 'prince_loan_collection',
         petitioner: "The Smug Prince of Almorg",
-        text: "I've returned as promised for my 100 gold. I trust it's ready?",
+        text: "I've returned as promised for my 500 gold. I trust it's ready?",
         condition: (gs) => gs.flags.has('loan_from_prince') && gs.day >= gs.flags.get('loan_from_prince') + 10,
-        onYes: { text: "He counts the coins and nods. 'Until next time.' The debt is settled.", effects: { treasury: -100 }, clearFlags: ['loan_from_prince'] },
-        onNo: {
+        onYes: { // This is the "peaceful repayment" option
+            text: "He counts the coins and nods. 'Until next time.' The debt is settled.",
+            effects: { treasury: -500 },
+            clearFlags: ['loan_from_prince']
+        },
+        onNo: { // This is the "fight" option
             text: "You refuse to pay. This is an act of war! His army marches on your kingdom.",
             clearFlags: ['loan_from_prince'],
-            // The outcome of the war is a matter of luck in this version. Your military strength matters for other things!
+            onSuccess: (gs) => { gs.flags.set('prince_is_enemy', true); },
             random_outcomes: [
                 { chance: 0.5, text: "Against the odds, your forces claim a stunning victory! The debt is erased by the sword.", effects: { military: -10, happiness: +20 } },
                 { chance: 0.5, text: "His professional army crushes yours. Your defeat is swift and humiliating.", effects: { military: -20, population: -15, happiness: -25, treasury: -50 } }
@@ -90,10 +99,9 @@ const allEvents = [
         petitioner: "The Guard Captain",
         text: "He's back! The kid has returned from his adventure, looking muddy but triumphant. Shall we see what he found?",
         condition: (gs) => gs.flags.has('kid_on_adventure') && gs.day >= gs.flags.get('kid_on_adventure') + 3,
-        // Both choices lead to the same outcome: the random reward.
         onYes: {
             text: "You welcome the young hero back!",
-            effects: { military: +10 }, // The guards return
+            effects: { military: +10 },
             clearFlags: ['kid_on_adventure'],
             random_outcomes: [
                 { chance: 0.05, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
@@ -102,7 +110,7 @@ const allEvents = [
                 { chance: 0.20, text: "He proudly presents you with a... weirdly shaped rock.", effects: { treasury: +1 } }
             ]
         },
-        onNo: { // The 'no' choice is just flavor text, the outcome is identical.
+        onNo: {
             text: "You greet the returning adventurer.",
             effects: { military: +10 },
             clearFlags: ['kid_on_adventure'],
@@ -121,7 +129,7 @@ const allEvents = [
     { id: 'recruit_spymaster', petitioner: "A cloaked figure", text: "Knowledge is power, your Majesty. Secrets are a weapon. I can be your weapon... for a price.", requiresNoAdvisor: 'spymaster', onYes: { text: "The figure nods. 'My whispers will serve you.'", effects: {}, onSuccess: (gs) => { gs.advisors.set('spymaster', true); } }, onNo: { text: "The figure melts back into the shadows.", effects: {} } },
     { id: 'general_report', advisor: 'general', petitioner: () => ADVISORS.general.name, text: (gs) => `My liege, our military strength is ${gs.military}. I request 50 gold for training exercises.`, onYes: { text: "The training exercises are a success!", effects: { treasury: -50, military: +15 } }, onNo: { text: "'As you command,' the General says, disappointed.", effects: { happiness: -5 } } },
     { id: 'spymaster_report', advisor: 'spymaster', petitioner: () => ADVISORS.spymaster.name, text: "A whisper... A noble family plots against you. For 25 gold, I can... 'discourage' them.", onYes: { text: "The problem is dealt with. The nobles are suddenly very loyal.", effects: { treasury: -25, happiness: +10 } }, onNo: { text: "You let them be. Dissent grows.", effects: { happiness: -15 } } },
-    
+
     // --- Other Chained & Standard Events ---
     { id: 'farmer_blight', petitioner: "A Farmer", text: "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds.", onYes: { text: "The farmers are grateful! They promise to remember your generosity.", effects: { treasury: -50, happiness: +15 }, onSuccess: (gs) => { gs.flags.set('helped_farmer_blight', gs.day); } }, onNo: { text: "The farmers despair.", effects: { happiness: -15, population: -10 } } },
     { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
@@ -133,7 +141,7 @@ const allEvents = [
     { id: 'traveling_circus', petitioner: "A Traveling Circus", text: "For 30 gold, our circus will perform and lift the spirits of your citizens!", onYes: { text: "The circus is a hit!", effects: { treasury: -30, happiness: +25 } }, onNo: { text: "The circus packs up and leaves.", effects: { happiness: -5 } } },
     { id: 'goblin_raid', petitioner: "A Scout", text: (gs) => `Goblins are raiding the western farms! Our military strength is only ${gs.military}!`, condition: (gs) => gs.military < 30, onYes: { text: "The guards repel the goblins, but take some losses.", effects: { military: -5, happiness: +10, treasury: -10 } }, onNo: { text: "The goblins raid several farms before retreating.", effects: { happiness: -15, population: -10, treasury: -20 } } },
     { id: 'migrant_group', petitioner: "The Guard Captain", text: "A group of 20 migrants has arrived at the gates, seeking refuge.", onYes: { text: "You welcome them. They are hardworking and grateful.", effects: { population: +20, happiness: +5 } }, onNo: { text: "You turn the migrants away.", effects: { happiness: -10 } } },
-    
+
     // --- Seasonal Events ---
     { id: 'spring_festival', season: 'Spring', petitioner: "A Cheerful Villager", text: "Let's celebrate the end of winter with a grand Spring Festival! It will cost 40 gold.", onYes: { text: "The festival is a joyous success!", effects: { treasury: -40, happiness: +25 } }, onNo: { text: "You cancel the festival.", effects: { happiness: -10 } } },
     { id: 'summer_drought', season: 'Summer', petitioner: "A Worried Farmer", text: "There has been no rain for weeks! Our crops are withering. We need 50 gold for irrigation.", onYes: { text: "The irrigation effort saves the harvest!", effects: { treasury: -50, population: +5 } }, onNo: { text: "The crops fail under the blazing sun.", effects: { happiness: -10, population: -10 } } },
