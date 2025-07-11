@@ -1,11 +1,12 @@
 // server.js
 
 // --- CHANGE LOG ---
-// 1. Corrected major logic error in `handleConfirmation` for game resets.
-//    - The function no longer makes a faulty call back to `createKingdom`.
-//    - It now resets the kingdom's state directly, ensuring correct and efficient operation.
-// 2. Improved `KingdomSchema` for the `advisors` field.
-//    - Changed `default: {}` to `default: () => new Map()` for better consistency and to ensure a new Map is created for each new kingdom.
+// 1. FIXED: Tax income is now correctly calculated and added to the treasury each day.
+//    - The logic now uses `income_per_10_pop` from the `TAX_LEVELS` object.
+// 2. IMPLEMENTED: The Treasurer advisor's 10% tax bonus is now functional.
+//    - The tax income calculation checks if the treasurer is hired and applies the bonus.
+// 3. RESTRUCTURED: The daily upkeep logic in `requestNextChat` has been reordered
+//    and commented for better clarity (Income -> Expenses).
 // --- END CHANGE LOG ---
 
 
@@ -31,15 +32,14 @@ const KingdomSchema = new mongoose.Schema({
     taxChangeCooldown: { type: Number, default: 0 },
     season: { type: String, default: 'Spring' },
     dayOfSeason: { type: Number, default: 1 },
-    // UPDATED: Changed default to create a new Map instance for each new document.
     advisors: { type: Map, of: Boolean, default: () => new Map() },
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
-    pendingAction: { // The new field for confirmations
+    pendingAction: {
         type: {
-            action: String, // e.g., 'confirm_reset'
-            expires: Date   // When the confirmation window closes
+            action: String,
+            expires: Date
         },
         default: null
     }
@@ -67,22 +67,20 @@ async function createKingdom(playerName) {
     const existingKingdom = await Kingdom.findById(playerName);
 
     if (existingKingdom && existingKingdom.gameActive) {
-        // Kingdom exists, so start the confirmation process
-        const expirationTime = new Date(Date.now() + 30000); // 30-second window
+        const expirationTime = new Date(Date.now() + 30000);
         existingKingdom.pendingAction = {
             action: 'confirm_reset',
             expires: expirationTime
         };
         await existingKingdom.save();
 
-        // Automatically cancel the action after 30 seconds
         setTimeout(async () => {
             const freshState = await Kingdom.findById(playerName);
             if (freshState && freshState.pendingAction && freshState.pendingAction.action === 'confirm_reset' && new Date() > freshState.pendingAction.expires) {
                 freshState.pendingAction = null;
                 await freshState.save();
             }
-        }, 31000); // Set slightly longer than the check to avoid race conditions
+        }, 31000);
 
         return [
             `${playerName}, you already have a kingdom in progress.`,
@@ -91,7 +89,6 @@ async function createKingdom(playerName) {
         ];
     }
 
-    // No active kingdom exists, so create one immediately.
     await Kingdom.findByIdAndUpdate(playerName, {
         _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
         taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), gameActive: true,
@@ -101,8 +98,6 @@ async function createKingdom(playerName) {
     return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
 }
 
-
-// --- UPDATED & CORRECTED FUNCTION ---
 async function handleConfirmation(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
 
@@ -111,11 +106,10 @@ async function handleConfirmation(playerName, choice) {
     }
 
     const action = playerState.pendingAction.action;
-    playerState.pendingAction = null; // Clear the action immediately
+    playerState.pendingAction = null;
 
     if (action === 'confirm_reset') {
         if (choice === '!y') {
-            // Player confirmed. Reset the kingdom state directly here.
             playerState.day = 0;
             playerState.treasury = 100;
             playerState.happiness = 50;
@@ -125,26 +119,21 @@ async function handleConfirmation(playerName, choice) {
             playerState.taxChangeCooldown = 0;
             playerState.season = 'Spring';
             playerState.dayOfSeason = 1;
-            playerState.advisors = new Map(); // Reset advisors
-            playerState.gameActive = true;     // Ensure it's active
+            playerState.advisors = new Map();
+            playerState.gameActive = true;
             playerState.isAwaitingDecision = false;
             playerState.currentEventId = null;
-            // pendingAction is already null
 
-            await playerState.save(); // Save the fully reset state
-
+            await playerState.save();
             return [`${playerName}'s kingdom has been reset.`];
-
-        } else { // Handles !n
-            await playerState.save(); // Save the state with pendingAction cleared
+        } else {
+            await playerState.save();
             return [`${playerName}, restart cancelled. Your kingdom is safe.`];
         }
     }
-    // It's good practice to save even if no action matches, to clear the pendingAction
     await playerState.save();
-    return []; // Should not be reached
+    return [];
 }
-
 
 async function destroyKingdom(playerName, reason) {
     const kingdom = await Kingdom.findById(playerName);
@@ -154,6 +143,8 @@ async function destroyKingdom(playerName, reason) {
     return [`--- ${playerName}'s reign has ended after ${kingdom.day} days. ---`, `Reason: ${reason}`];
 }
 
+
+// --- FUNCTION WITH UPDATED TAX LOGIC ---
 async function requestNextChat(playerName) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to start.`];
@@ -162,9 +153,15 @@ async function requestNextChat(playerName) {
 
     const replies = [];
     const oldStats = { ...playerState.toObject() };
+
+    // --- Daily Time Progression ---
     playerState.day++;
     if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
     playerState.dayOfSeason++;
+
+    // --- Daily Upkeep & Income Calculations ---
+
+    // 1. Handle Season Change & Apply Daily Season Effects
     if (playerState.dayOfSeason > SEASON_LENGTH) {
         playerState.dayOfSeason = 1;
         const seasonNames = Object.keys(SEASONS);
@@ -173,8 +170,22 @@ async function requestNextChat(playerName) {
     }
     const seasonEffect = SEASONS[playerState.season].effects;
     for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
-    const taxEffect = TAX_LEVELS[playerState.taxRate].happiness_effect;
-    if (taxEffect !== 0) playerState.happiness += taxEffect;
+
+    // 2. Calculate and Apply Tax Effects (Income & Happiness) - THIS IS THE CORRECTED LOGIC
+    const taxInfo = TAX_LEVELS[playerState.taxRate];
+    if (taxInfo) {
+        // Calculate income, including the Treasurer's 10% bonus if hired
+        const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
+        const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
+        playerState.treasury += taxIncome;
+
+        // Apply happiness effect
+        if (taxInfo.happiness_effect !== 0) {
+            playerState.happiness += taxInfo.happiness_effect;
+        }
+    }
+
+    // 3. Calculate and Apply Advisor Upkeep (Salaries & Passive Effects)
     let totalSalary = 0;
     if (playerState.advisors) {
         for (const [advisorKey, isHired] of playerState.advisors) {
@@ -189,6 +200,7 @@ async function requestNextChat(playerName) {
     }
     playerState.treasury -= totalSalary;
 
+    // --- Generate Reports & Check Game Over Conditions ---
     let upkeepReport = [];
     if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
     if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
@@ -203,6 +215,7 @@ async function requestNextChat(playerName) {
     }
     if (playerState.happiness <= 0) return destroyKingdom(playerName, "The people have revolted!");
 
+    // --- Select and Present a New Event ---
     const availableEvents = allEvents.filter(e => {
         const condition = e.condition ? e.condition(playerState) : true;
         const seasonCondition = e.season ? e.season === playerState.season : true;
@@ -229,6 +242,7 @@ async function requestNextChat(playerName) {
     replies.push("What do you say? (!yes / !no)");
     return replies;
 }
+
 
 async function handleDecision(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
