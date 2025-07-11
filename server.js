@@ -1,5 +1,14 @@
 // server.js
 
+// --- CHANGE LOG ---
+// 1. Corrected major logic error in `handleConfirmation` for game resets.
+//    - The function no longer makes a faulty call back to `createKingdom`.
+//    - It now resets the kingdom's state directly, ensuring correct and efficient operation.
+// 2. Improved `KingdomSchema` for the `advisors` field.
+//    - Changed `default: {}` to `default: () => new Map()` for better consistency and to ensure a new Map is created for each new kingdom.
+// --- END CHANGE LOG ---
+
+
 // --- 1. SETUP & IMPORTS ---
 const express = require('express');
 const cors = require('cors');
@@ -22,7 +31,8 @@ const KingdomSchema = new mongoose.Schema({
     taxChangeCooldown: { type: Number, default: 0 },
     season: { type: String, default: 'Spring' },
     dayOfSeason: { type: Number, default: 1 },
-    advisors: { type: Map, of: Boolean, default: {} },
+    // UPDATED: Changed default to create a new Map instance for each new document.
+    advisors: { type: Map, of: Boolean, default: () => new Map() },
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
@@ -91,6 +101,8 @@ async function createKingdom(playerName) {
     return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
 }
 
+
+// --- UPDATED & CORRECTED FUNCTION ---
 async function handleConfirmation(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
 
@@ -99,30 +111,40 @@ async function handleConfirmation(playerName, choice) {
     }
 
     const action = playerState.pendingAction.action;
-    playerState.pendingAction = null; // Clear the action immediately regardless of choice
-    await playerState.save();
+    playerState.pendingAction = null; // Clear the action immediately
 
     if (action === 'confirm_reset') {
         if (choice === '!y') {
-            // Player confirmed, now we can call the reset logic.
-            // We can reuse createKingdom. It will now find no active kingdom (since pendingAction is cleared) and proceed.
-            // A bit of a trick: we call it again, but this time the check at the top will fail.
-            const resetMessage = await createKingdom(playerName); // This will now go down the "create" path.
-            // We need to re-call the function, this time it will succeed
-             await Kingdom.findByIdAndUpdate(playerName, {
-                _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
-                taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), gameActive: true,
-                isAwaitingDecision: false, currentEventId: null, pendingAction: null
-            }, { upsert: true, new: true });
+            // Player confirmed. Reset the kingdom state directly here.
+            playerState.day = 0;
+            playerState.treasury = 100;
+            playerState.happiness = 50;
+            playerState.population = 100;
+            playerState.military = 10;
+            playerState.taxRate = 'normal';
+            playerState.taxChangeCooldown = 0;
+            playerState.season = 'Spring';
+            playerState.dayOfSeason = 1;
+            playerState.advisors = new Map(); // Reset advisors
+            playerState.gameActive = true;     // Ensure it's active
+            playerState.isAwaitingDecision = false;
+            playerState.currentEventId = null;
+            // pendingAction is already null
+
+            await playerState.save(); // Save the fully reset state
 
             return [`${playerName}'s kingdom has been reset.`];
 
         } else { // Handles !n
+            await playerState.save(); // Save the state with pendingAction cleared
             return [`${playerName}, restart cancelled. Your kingdom is safe.`];
         }
     }
+    // It's good practice to save even if no action matches, to clear the pendingAction
+    await playerState.save();
     return []; // Should not be reached
 }
+
 
 async function destroyKingdom(playerName, reason) {
     const kingdom = await Kingdom.findById(playerName);
@@ -262,7 +284,15 @@ async function showStatus(playerName) {
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to begin.`];
     let advisorList = 'None';
     if (playerState.advisors && playerState.advisors.size > 0) {
-        advisorList = Array.from(playerState.advisors.keys()).map(key => ADVISORS[key].name).join(', ');
+        const hiredAdvisors = [];
+        for (const [key, isHired] of playerState.advisors.entries()) {
+            if (isHired) {
+                hiredAdvisors.push(ADVISORS[key].name);
+            }
+        }
+        if (hiredAdvisors.length > 0) {
+            advisorList = hiredAdvisors.join(', ');
+        }
     }
     return [
         `--- ${playerName}'s Kingdom Status (Day ${playerState.day}) ---`,
