@@ -15,7 +15,7 @@
 // --- 1. SETUP & IMPORTS ---
 const express = require('express');
 const cors = require('cors');
-const mongoose = 'mongoose';
+const mongoose = ('mongoose');
 
 // Assuming gameData.js is in the same directory and is complete
 const {
