@@ -1,27 +1,30 @@
 // server.js
 
 // --- CHANGE LOG ---
-// 1. ADDED: `flags` field to KingdomSchema to track long-term consequences of decisions.
-// 2. UPDATED: Reset logic in `createKingdom` and `handleConfirmation` now also clears flags.
-// 3. UPGRADED: `handleDecision` function now processes `random_outcomes` for events with chance-based results.
-// 4. UPGRADED: `handleDecision` can now set flags via `onSuccess` and clear them via `clearFlags` to manage event chains.
-// 5. IMPROVED: The status report in `handleDecision` is now more robust, showing all changes even from random outcomes.
+// 1. PACING OVERHAUL: A "day" now consists of 3-10 events. Daily upkeep is only
+//    processed once all of the day's events are handled.
+// 2. COOLDOWN SYSTEM: Events now have a 30-day cooldown after they occur to prevent repetition.
+// 3. NEW SCHEMA FIELDS: Added `eventCooldowns`, `eventsToday`, and `eventIndex` to the
+//    KingdomSchema to manage the new pacing and cooldown systems.
+// 4. LOGIC OVERHAUL: `requestNextChat` and `handleDecision` have been significantly
+//    rewritten to support the new multi-event day loop.
+// 5. HELPER FUNCTION: Added `presentEvent` to reduce code duplication.
 // --- END CHANGE LOG ---
 
 
 // --- 1. SETUP & IMPORTS ---
 const express = require('express');
 const cors = require('cors');
-const mongoose = require('mongoose');
+const mongoose = 'mongoose';
 
 // Assuming gameData.js is in the same directory and is complete
 const {
-    TAX_LEVELS, REVOLT_HAPPINESS_THRESHOLD, SEASON_LENGTH, SEASONS, ADVISORS, allEvents, eventsMap
+    TAX_LEVELS, REVOLT_HAPPINESS_THRESHOLD, SEASON_LENGTH, SEASONS, ADVISORS, allEvents, eventsMap, EVENT_COOLDOWN_DAYS
 } = require('./gameData');
 
 // --- 2. MONGOOSE SCHEMA DEFINITION ---
 const KingdomSchema = new mongoose.Schema({
-    _id: { type: String, required: true }, // Player's name
+    _id: { type: String, required: true },
     day: { type: Number, default: 0 },
     treasury: { type: Number, default: 100 },
     happiness: { type: Number, default: 50 },
@@ -32,8 +35,13 @@ const KingdomSchema = new mongoose.Schema({
     season: { type: String, default: 'Spring' },
     dayOfSeason: { type: Number, default: 1 },
     advisors: { type: Map, of: Boolean, default: () => new Map() },
-    // NEW: Flags to track story choices and unlock future events.
     flags: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
+
+    // --- NEW FIELDS FOR PACING & COOLDOWNS ---
+    eventCooldowns: { type: Map, of: Number, default: () => new Map() }, // eventId -> day last seen
+    eventsToday: { type: [String], default: [] }, // A queue of event IDs for the current day
+    eventIndex: { type: Number, default: 0 }, // Which event in the queue we are on
+
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
@@ -69,10 +77,7 @@ async function createKingdom(playerName) {
 
     if (existingKingdom && existingKingdom.gameActive) {
         const expirationTime = new Date(Date.now() + 30000);
-        existingKingdom.pendingAction = {
-            action: 'confirm_reset',
-            expires: expirationTime
-        };
+        existingKingdom.pendingAction = { action: 'confirm_reset', expires: expirationTime };
         await existingKingdom.save();
 
         setTimeout(async () => {
@@ -90,11 +95,11 @@ async function createKingdom(playerName) {
         ];
     }
 
-    // UPDATED: Resetting the kingdom now also clears flags.
     await Kingdom.findByIdAndUpdate(playerName, {
         _id: playerName, day: 0, treasury: 100, happiness: 50, population: 100, military: 10, taxRate: 'normal',
-        taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), flags: new Map(), gameActive: true,
-        isAwaitingDecision: false, currentEventId: null, pendingAction: null
+        taxChangeCooldown: 0, season: 'Spring', dayOfSeason: 1, advisors: new Map(), flags: new Map(),
+        eventCooldowns: new Map(), eventsToday: [], eventIndex: 0,
+        gameActive: true, isAwaitingDecision: false, currentEventId: null, pendingAction: null
     }, { upsert: true, new: true });
 
     return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
@@ -112,7 +117,6 @@ async function handleConfirmation(playerName, choice) {
 
     if (action === 'confirm_reset') {
         if (choice === '!y') {
-            // UPDATED: Ensure flags are reset
             playerState.day = 0;
             playerState.treasury = 100;
             playerState.happiness = 50;
@@ -123,7 +127,10 @@ async function handleConfirmation(playerName, choice) {
             playerState.season = 'Spring';
             playerState.dayOfSeason = 1;
             playerState.advisors = new Map();
-            playerState.flags = new Map(); // Clear flags on reset
+            playerState.flags = new Map();
+            playerState.eventCooldowns = new Map();
+            playerState.eventsToday = [];
+            playerState.eventIndex = 0;
             playerState.gameActive = true;
             playerState.isAwaitingDecision = false;
             playerState.currentEventId = null;
@@ -153,50 +160,63 @@ async function requestNextChat(playerName) {
     if (playerState.isAwaitingDecision) return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
 
+    // Part 1: Check if there are still events left for the current day
+    if (playerState.eventIndex < playerState.eventsToday.length) {
+        const eventId = playerState.eventsToday[playerState.eventIndex];
+        const event = eventsMap.get(eventId);
+        const replies = presentEvent(playerState, event, `Petitioner ${playerState.eventIndex + 1} of ${playerState.eventsToday.length} for today.`);
+        await playerState.save();
+        return replies;
+    }
+
+    // Part 2: If not, the day is over. Process daily upkeep and start a new day.
     const replies = [];
     const oldStats = { ...playerState.toObject() };
 
-    playerState.day++;
-    if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
-    playerState.dayOfSeason++;
+    if (playerState.day > 0) {
+        const seasonEffect = SEASONS[playerState.season].effects;
+        for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
+        const taxInfo = TAX_LEVELS[playerState.taxRate];
+        if (taxInfo) {
+            const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
+            const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
+            playerState.treasury += taxIncome;
+            if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
+        }
+
+        let totalSalary = 0;
+        if (playerState.advisors) {
+            for (const [advisorKey, isHired] of playerState.advisors) {
+                if (isHired) {
+                    const advisor = ADVISORS[advisorKey];
+                    if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary;
+                    if (advisor.upkeep.effects) {
+                        for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat];
+                    }
+                }
+            }
+        }
+        playerState.treasury -= totalSalary;
+        
+        let upkeepReport = [];
+        if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
+        if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
+        if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
+        if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
+        if (upkeepReport.length > 0) replies.push(`--- End of Day ${playerState.day} Report ---\nDaily changes: ${upkeepReport.join(' | ')}`);
+    }
+
+    // Advance time
+    playerState.day++;
+    playerState.dayOfSeason++;
+    if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
     if (playerState.dayOfSeason > SEASON_LENGTH) {
         playerState.dayOfSeason = 1;
         const seasonNames = Object.keys(SEASONS);
         playerState.season = seasonNames[(seasonNames.indexOf(playerState.season) + 1) % seasonNames.length];
-        replies.push(`A new season has begun in ${playerName}'s kingdom: ${playerState.season}!`);
+        replies.push(`A new season has begun: ${playerState.season}!`);
     }
-    const seasonEffect = SEASONS[playerState.season].effects;
-    for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
-
-    const taxInfo = TAX_LEVELS[playerState.taxRate];
-    if (taxInfo) {
-        const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
-        const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
-        playerState.treasury += taxIncome;
-        if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
-    }
-
-    let totalSalary = 0;
-    if (playerState.advisors) {
-        for (const [advisorKey, isHired] of playerState.advisors) {
-            if (isHired) {
-                const advisor = ADVISORS[advisorKey];
-                if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary;
-                if (advisor.upkeep.effects) {
-                    for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat];
-                }
-            }
-        }
-    }
-    playerState.treasury -= totalSalary;
-
-    let upkeepReport = [];
-    if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
-    if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
-    if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
-    if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
-    if (upkeepReport.length > 0) replies.push(`Daily changes for ${playerName}: ${upkeepReport.join(' | ')}`);
 
     if (playerState.treasury < 0) return destroyKingdom(playerName, "The kingdom is bankrupt!");
     if (playerState.happiness <= REVOLT_HAPPINESS_THRESHOLD && playerState.taxRate !== 'low') {
@@ -205,8 +225,14 @@ async function requestNextChat(playerName) {
     }
     if (playerState.happiness <= 0) return destroyKingdom(playerName, "The people have revolted!");
 
-    // The existing filtering logic naturally supports flags via the 'condition' function
-    const availableEvents = allEvents.filter(e => {
+    // Part 3: Generate a new queue of events for the new day
+    const numEventsForToday = Math.floor(Math.random() * (10 - 3 + 1)) + 3;
+    const newEventQueue = [];
+
+    let availableEvents = allEvents.filter(e => {
+        const lastSeen = playerState.eventCooldowns.get(e.id);
+        if (lastSeen && playerState.day < lastSeen + EVENT_COOLDOWN_DAYS) return false;
+
         const condition = e.condition ? e.condition(playerState) : true;
         const seasonCondition = e.season ? e.season === playerState.season : true;
         let advisorCondition = true;
@@ -215,26 +241,45 @@ async function requestNextChat(playerName) {
         return condition && seasonCondition && advisorCondition;
     });
 
-    const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)];
-    if (!chosenEvent) {
-        replies.push("The kingdom is quiet today. No one has come to petition the throne.");
+    for (let i = 0; i < numEventsForToday; i++) {
+        if (availableEvents.length === 0) break;
+        const eventIndex = Math.floor(Math.random() * availableEvents.length);
+        const chosenEvent = availableEvents[eventIndex];
+        newEventQueue.push(chosenEvent.id);
+        availableEvents.splice(eventIndex, 1);
+    }
+    
+    playerState.eventsToday = newEventQueue;
+    playerState.eventIndex = 0;
+
+    if (playerState.eventsToday.length === 0) {
+        replies.push(`--- Day ${playerState.day} ---`, "The kingdom is quiet today. No one has come to petition the throne.");
         await playerState.save();
         return replies;
     }
-    playerState.currentEventId = chosenEvent.id;
-    playerState.isAwaitingDecision = true;
-    await playerState.save();
 
-    const petitioner = typeof chosenEvent.petitioner === 'function' ? chosenEvent.petitioner() : chosenEvent.petitioner;
-    const eventText = typeof chosenEvent.text === 'function' ? chosenEvent.text(playerState) : chosenEvent.text;
-    replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} ---`);
-    replies.push(`${petitioner} wants to talk.`);
-    replies.push(`"${eventText}"`);
-    replies.push("What do you say? (!yes / !no)");
+    const firstEvent = eventsMap.get(playerState.eventsToday[0]);
+    replies.push(...presentEvent(playerState, firstEvent, `A new day begins! Petitioner 1 of ${playerState.eventsToday.length}.`));
+    await playerState.save();
     return replies;
 }
 
-// --- UPGRADED FUNCTION to handle new event types ---
+function presentEvent(playerState, event, dayStatus) {
+    playerState.currentEventId = event.id;
+    playerState.isAwaitingDecision = true;
+    
+    const petitioner = typeof event.petitioner === 'function' ? event.petitioner() : event.petitioner;
+    const eventText = typeof event.text === 'function' ? event.text(playerState) : event.text;
+
+    return [
+        `--- ${playerState._id}'s Kingdom, Day ${playerState.day} ---`,
+        `(${dayStatus})`,
+        `${petitioner} wants to talk.`,
+        `"${eventText}"`,
+        "What do you say? (!yes / !no)"
+    ];
+}
+
 async function handleDecision(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive || !playerState.isAwaitingDecision) return [];
@@ -244,68 +289,68 @@ async function handleDecision(playerName, choice) {
         playerState.isAwaitingDecision = false; await playerState.save();
         return ["An error occurred with your current event. Type !chat to continue."];
     }
+    
+    playerState.eventCooldowns.set(playerState.currentEventId, playerState.day);
+
     const oldStats = { ...playerState.toObject() };
     const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
     const chosenOutcome = currentEvent[decisionKey];
-
+    
     const replies = [`${playerName}, ${chosenOutcome.text}`];
 
-    // --- NEW: Handle Random Outcomes ---
     if (chosenOutcome.random_outcomes) {
         const roll = Math.random();
         let cumulativeChance = 0;
         for (const outcome of chosenOutcome.random_outcomes) {
             cumulativeChance += outcome.chance;
             if (roll < cumulativeChance) {
-                // This is the chosen random outcome
                 replies.push(outcome.text);
                 if (outcome.effects) {
                     for (const stat in outcome.effects) {
                         if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat];
                     }
                 }
-                break; // Stop after finding the outcome
+                break;
             }
         }
     }
 
-    // Apply standard effects
     if (chosenOutcome.effects) {
         for (const stat in chosenOutcome.effects) {
             if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat];
         }
     }
-    // Set/update flags or perform other special actions
     if (chosenOutcome.onSuccess) { chosenOutcome.onSuccess(playerState); }
-
-    // --- NEW: Clear flags after the event is done ---
     if (chosenOutcome.clearFlags) {
         chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
     }
 
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
-    await playerState.save();
+    playerState.eventIndex++;
 
-    // --- IMPROVED: Generate a more robust status report ---
+    await playerState.save();
+    
     let statusChanges = [];
-    // Collect all possible stat keys that could have been affected
     const allEffectKeys = Object.keys(chosenOutcome.effects || {});
     if (chosenOutcome.random_outcomes) {
         chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.push(k)));
     }
     const uniqueKeys = [...new Set(allEffectKeys)];
-
     for (const stat of uniqueKeys) {
         if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) {
             statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
         }
     }
-
     if (statusChanges.length > 0) replies.push(statusChanges.join(' | '));
+
+    if (playerState.eventIndex < playerState.eventsToday.length) {
+        replies.push("Type !chat to speak to the next petitioner.");
+    } else {
+        replies.push("You have seen everyone for today. Type !chat to start the next day.");
+    }
     return replies;
 }
-
 
 async function handleSetTax(playerName, newRate) {
     const playerState = await Kingdom.findById(playerName);
