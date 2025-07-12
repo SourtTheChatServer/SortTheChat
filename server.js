@@ -1,14 +1,9 @@
 // server.js
 
 // --- CHANGE LOG ---
-// 1. RESTRUCTURED: The game loop now supports multiple events per day.
-// 2. UPDATED: Tax formula to a "high-growth" model based on happiness.
-// 3. UPDATED: Logic to support "isNarrativeOnly" events and `isUnique` events.
-// 4. ADDED: Event reminder system for players with a pending decision.
-// 5. ADDED: "Crime & Punishment" system.
-//    - New `jailedPopulation` stat and daily upkeep costs.
-//    - New `active_crime_gang` flag with an "entrenched" state for double penalty.
-//    - Logic for automatic prisoner release after a set time.
+// 1. BUG FIX: Corrected a TypeError in the `formatStatChange` function that occurred when population changed.
+// 2. IMPROVED: The stat change reporting in `handleDecision` is now more robust and will correctly report changes from all events, including the Crime & Punishment system.
+// 3. All previous features (Crime system, unique events, emojis, etc.) are preserved.
 // --- END CHANGE LOG ---
 
 
@@ -23,13 +18,13 @@ const {
 
 // --- 2. MONGOOSE SCHEMA DEFINITION ---
 const KingdomSchema = new mongoose.Schema({
-    _id: { type: String, required: true }, // Player's name
+    _id: { type: String, required: true },
     day: { type: Number, default: 0 },
     treasury: { type: Number, default: 100 },
     happiness: { type: Number, default: 50 },
     population: { type: Number, default: 100 },
     military: { type: Number, default: 10 },
-    jailedPopulation: { type: Number, default: 0 }, // New stat
+    jailedPopulation: { type: Number, default: 0 },
     taxRate: { type: String, default: 'normal' },
     taxChangeCooldown: { type: Number, default: 0 },
     season: { type: String, default: 'Spring' },
@@ -95,12 +90,8 @@ async function createKingdom(playerName) {
 
     if (existingKingdom && existingKingdom.gameActive) {
         const expirationTime = new Date(Date.now() + 30000);
-        existingKingdom.pendingAction = {
-            action: 'confirm_reset',
-            expires: expirationTime
-        };
+        existingKingdom.pendingAction = { action: 'confirm_reset', expires: expirationTime };
         await existingKingdom.save();
-
         setTimeout(async () => {
             const freshState = await Kingdom.findById(playerName);
             if (freshState && freshState.pendingAction && freshState.pendingAction.action === 'confirm_reset' && new Date() > freshState.pendingAction.expires) {
@@ -108,7 +99,6 @@ async function createKingdom(playerName) {
                 await freshState.save();
             }
         }, 31000);
-
         return [
             `${playerName}, you already have a kingdom in progress.`,
             `Are you sure you want to restart? This will ERASE your current game. 💥`,
@@ -125,14 +115,11 @@ async function createKingdom(playerName) {
 
 async function handleConfirmation(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
-
     if (!playerState || !playerState.pendingAction || new Date() > playerState.pendingAction.expires) {
         return [`${playerName}, you have no pending action to confirm, or the confirmation window has expired.`];
     }
-
     const action = playerState.pendingAction.action;
     playerState.pendingAction = null;
-
     if (action === 'confirm_reset') {
         if (choice === '!y') {
             resetKingdomState(playerState);
@@ -162,7 +149,7 @@ async function requestNextChat(playerName) {
     if (playerState.isAwaitingDecision) {
         const currentEvent = eventsMap.get(playerState.currentEventId);
         if (!currentEvent) {
-            playerState.isAwaitingDecision = false; // Fix a potential stuck state
+            playerState.isAwaitingDecision = false;
             await playerState.save();
             return [`An error occurred with your last event. Please type !chat to continue.`];
         }
@@ -186,7 +173,6 @@ async function requestNextChat(playerName) {
 
         if (!isFirstTurnOfGame) {
             const oldStats = { ...playerState.toObject() };
-
             playerState.day++;
             if (playerState.taxChangeCooldown > 0) playerState.taxChangeCooldown--;
             playerState.dayOfSeason++;
@@ -200,39 +186,31 @@ async function requestNextChat(playerName) {
             const seasonEffect = SEASONS[playerState.season].effects;
             for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
-            // --- Tax Calculation (based on lawful population) ---
             const taxInfo = TAX_LEVELS[playerState.taxRate];
             const happinessModifier = Math.max(1, (playerState.happiness / 50) + 1);
-            const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop; // Population here is the tax-paying population
+            const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop;
             const incomeAfterHappiness = baseIncome * happinessModifier;
             const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
             let finalIncome = incomeAfterHappiness * treasurerBonus;
-
-            // --- Crime System Upkeep ---
             if (playerState.flags.get('active_crime_gang')) {
                 const dailyTheft = playerState.flags.get('active_crime_gang') === 'entrenched' ? 40 : 20;
-                finalIncome -= dailyTheft; // Subtract theft from income BEFORE Gilded Blight
+                finalIncome -= dailyTheft;
                 replies.push(`❗️ A criminal gang steals ${dailyTheft} 💰 from your coffers!`);
             }
-            
-            // --- Gilded Blight Upkeep ---
             if (playerState.flags.get('gilded_blight_active')) {
                 finalIncome = finalIncome * 0.75; 
                 replies.push("❗️ The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
             }
-
             const taxIncome = Math.floor(finalIncome);
             playerState.treasury += taxIncome;
             if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
             
-            // --- General & Jail Upkeep ---
             let totalSalary = 0;
             for (const [advisorKey, isHired] of playerState.advisors) { if (isHired) { const advisor = ADVISORS[advisorKey]; if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary; if (advisor.upkeep.effects) { for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat]; } } }
             playerState.treasury -= totalSalary;
             const jailUpkeep = Math.floor((playerState.jailedPopulation || 0) * 0.5);
             playerState.treasury -= jailUpkeep;
 
-            // --- Prisoner Release Logic ---
             let prisoners = playerState.flags.get('prisoners') || [];
             const remainingPrisoners = [];
             let releasedCount = 0;
@@ -249,13 +227,16 @@ async function requestNextChat(playerName) {
                 replies.push(`⛓️ ${releasedCount} prisoners have served their time and been released back into the populace.`);
                 playerState.flags.set('prisoners', remainingPrisoners);
             }
-            if (playerState.jailedPopulation < 0) playerState.jailedPopulation = 0; // Failsafe
+            if (playerState.jailedPopulation < 0) playerState.jailedPopulation = 0;
 
             let upkeepReport = [];
-            if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
-            if (playerState.population !== oldStats.population || playerState.jailedPopulation !== oldStats.jailedPopulation) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
-            if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
-            if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
+            const trackableStats = ['happiness', 'population', 'jailedPopulation', 'treasury', 'military'];
+            trackableStats.forEach(stat => {
+                 if (playerState[stat] !== oldStats[stat]) {
+                      upkeepReport.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
+                 }
+            });
+
             if (upkeepReport.length > 0) replies.push(`📈 Daily changes for ${playerName}: ${upkeepReport.join(' | ')}`);
             if (jailUpkeep > 0) replies.push(`⛓️ The upkeep for your ${playerState.jailedPopulation} prisoners costs ${jailUpkeep} 💰.`);
 
@@ -306,20 +287,52 @@ async function handleDecision(playerName, choice) {
     const oldStats = { ...playerState.toObject() };
     const replies = [];
     let chosenOutcome;
-    if (choice === '!narrative' && currentEvent.isNarrativeOnly) { chosenOutcome = currentEvent; replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`); }
-    else { const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo'; chosenOutcome = currentEvent[decisionKey]; if (!chosenOutcome) { return ["That is not a valid choice for this event."]; } replies.push(`💬 ${playerName}, ${chosenOutcome.text}`); }
+    let customOutcomeText = null;
+
+    if (choice === '!narrative' && currentEvent.isNarrativeOnly) {
+        chosenOutcome = currentEvent;
+        replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`);
+    } else {
+        const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
+        chosenOutcome = currentEvent[decisionKey];
+        if (!chosenOutcome) { return ["That is not a valid choice for this event."]; }
+        replies.push(`💬 ${playerName}, ${chosenOutcome.text}`);
+    }
 
     if (chosenOutcome.triggersGameOver) { return destroyKingdom(playerName, chosenOutcome.text); }
     if (chosenOutcome.random_outcomes) { const roll = Math.random(); let cumulativeChance = 0; for (const outcome of chosenOutcome.random_outcomes) { cumulativeChance += outcome.chance; if (roll < cumulativeChance) { replies.push(`🎲 ${outcome.text}`); if (outcome.effects) { for (const stat in outcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat]; } } break; } } }
-    if (chosenOutcome.effects) { for (const stat in chosenOutcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat]; } }
-    if (chosenOutcome.onSuccess) { chosenOutcome.onSuccess(playerState); }
-    if (chosenOutcome.clearFlags) { chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag)); }
+    if (chosenOutcome.effects) { for (const stat in chosenOutcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat]; } }
+    
+    // The onSuccess function can modify the game state directly
+    if (chosenOutcome.onSuccess) { 
+        chosenOutcome.onSuccess(playerState); 
+        // A special property to hold dynamic text generated by onSuccess
+        if (playerState.outcome_text) {
+            customOutcomeText = playerState.outcome_text;
+            delete playerState.outcome_text; // Clean up the temporary property
+        }
+    }
+    
+    if (customOutcomeText) {
+        replies.push(`⚖️ ${customOutcomeText}`);
+    }
 
+    if (chosenOutcome.clearFlags) { chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag)); }
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
     playerState.currentEventIndex++;
     await playerState.save();
-    let statusChanges = []; const allEffectKeys = new Set(Object.keys(chosenOutcome.effects || {})); if (chosenOutcome.random_outcomes) { chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.add(k))); } for (const stat of allEffectKeys) { if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) { statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat])); } } if (statusChanges.length > 0) replies.push(`📊 Stat Changes: ${statusChanges.join(' | ')}`);
+
+    // --- *** ROBUST Stat Change Reporting *** ---
+    let statusChanges = [];
+    const trackableStats = ['happiness', 'population', 'jailedPopulation', 'treasury', 'military'];
+    trackableStats.forEach(stat => {
+        if (oldStats[stat] !== playerState[stat]) {
+            statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
+        }
+    });
+
+    if (statusChanges.length > 0) replies.push(`📊 Stat Changes: ${statusChanges.join(' | ')}`);
     if (playerState.currentEventIndex >= playerState.eventsForToday.length) { replies.push("The day's business is concluded. ✅ Type !chat to start the next day."); }
     else { replies.push("A new petitioner approaches. 👉 Type !chat for your next event."); }
     return replies;
@@ -337,11 +350,10 @@ async function handleSetTax(playerName, newRate) {
     return [`✅ Your kingdom's tax rate is now set to ${TAX_LEVELS[newRate].label}.`];
 }
 
+// --- *** FIXED formatStatChange function *** ---
 function formatStatChange(stat, oldValue, newValue) {
-    const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '💂' };
-    if (stat === 'population' && 'jailedPopulation' in newValue) { // A bit of a hack for upkeep report
-        return `${symbols.population} ${oldValue.population} ➞ ${newValue.population} | ⛓️ ${oldValue.jailedPopulation} ➞ ${newValue.jailedPopulation}`;
-    }
+    const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '💂', jailedPopulation: '⛓️' };
+    // This function is now simple and robust.
     return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
 }
 
@@ -361,7 +373,7 @@ async function showStatus(playerName) {
         `🌸 Season: ${playerState.season}`,
         `👑 Council: ${advisorList}`
     ];
-    if (playerState.jailedPopulation > 0) {
+    if ((playerState.jailedPopulation || 0) > 0) {
         status.splice(4, 0, `⛓️ Jailed Population: ${playerState.jailedPopulation}`);
     }
     return status;
