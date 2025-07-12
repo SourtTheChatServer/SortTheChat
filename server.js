@@ -3,11 +3,12 @@
 // --- CHANGE LOG ---
 // 1. RESTRUCTURED: The game loop now supports multiple events per day.
 // 2. UPDATED: Tax formula to a "high-growth" model based on happiness.
-// 3. UPDATED: Logic to support "isNarrativeOnly" events for storytelling.
-// 4. REMOVED: The happiness cap to allow for infinite scaling.
-// 5. ADDED: Emojis to text output for better readability and visual appeal.
-// 6. ADDED: Event reminder system for players with a pending decision.
-// 7. BUG FIX: Implemented logic to handle `isUnique` events, preventing repeats in a single day (e.g., Prince's loan collection).
+// 3. UPDATED: Logic to support "isNarrativeOnly" events and `isUnique` events.
+// 4. ADDED: Event reminder system for players with a pending decision.
+// 5. ADDED: "Crime & Punishment" system.
+//    - New `jailedPopulation` stat and daily upkeep costs.
+//    - New `active_crime_gang` flag with an "entrenched" state for double penalty.
+//    - Logic for automatic prisoner release after a set time.
 // --- END CHANGE LOG ---
 
 
@@ -28,6 +29,7 @@ const KingdomSchema = new mongoose.Schema({
     happiness: { type: Number, default: 50 },
     population: { type: Number, default: 100 },
     military: { type: Number, default: 10 },
+    jailedPopulation: { type: Number, default: 0 }, // New stat
     taxRate: { type: String, default: 'normal' },
     taxChangeCooldown: { type: Number, default: 0 },
     season: { type: String, default: 'Spring' },
@@ -72,6 +74,7 @@ function resetKingdomState(playerState) {
     playerState.happiness = 50;
     playerState.population = 100;
     playerState.military = 10;
+    playerState.jailedPopulation = 0;
     playerState.taxRate = 'normal';
     playerState.taxChangeCooldown = 0;
     playerState.season = 'Spring';
@@ -159,12 +162,12 @@ async function requestNextChat(playerName) {
     if (playerState.isAwaitingDecision) {
         const currentEvent = eventsMap.get(playerState.currentEventId);
         if (!currentEvent) {
-            return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
+            playerState.isAwaitingDecision = false; // Fix a potential stuck state
+            await playerState.save();
+            return [`An error occurred with your last event. Please type !chat to continue.`];
         }
-
         const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner() : currentEvent.petitioner;
         const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
-
         return [
             `🔔 Just a reminder, ${playerName}... you're still in a conversation.`,
             `${petitioner} 🗣️ is waiting for your answer.`,
@@ -176,7 +179,6 @@ async function requestNextChat(playerName) {
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
 
     const replies = [];
-
     const isNewDay = playerState.currentEventIndex >= playerState.eventsForToday.length;
 
     if (isNewDay) {
@@ -198,38 +200,64 @@ async function requestNextChat(playerName) {
             const seasonEffect = SEASONS[playerState.season].effects;
             for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
+            // --- Tax Calculation (based on lawful population) ---
             const taxInfo = TAX_LEVELS[playerState.taxRate];
             const happinessModifier = Math.max(1, (playerState.happiness / 50) + 1);
-            const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop;
+            const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop; // Population here is the tax-paying population
             const incomeAfterHappiness = baseIncome * happinessModifier;
             const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
             let finalIncome = incomeAfterHappiness * treasurerBonus;
+
+            // --- Crime System Upkeep ---
+            if (playerState.flags.get('active_crime_gang')) {
+                const dailyTheft = playerState.flags.get('active_crime_gang') === 'entrenched' ? 40 : 20;
+                finalIncome -= dailyTheft; // Subtract theft from income BEFORE Gilded Blight
+                replies.push(`❗️ A criminal gang steals ${dailyTheft} 💰 from your coffers!`);
+            }
+            
+            // --- Gilded Blight Upkeep ---
             if (playerState.flags.get('gilded_blight_active')) {
                 finalIncome = finalIncome * 0.75; 
                 replies.push("❗️ The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
             }
+
             const taxIncome = Math.floor(finalIncome);
             playerState.treasury += taxIncome;
             if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
-
+            
+            // --- General & Jail Upkeep ---
             let totalSalary = 0;
-            for (const [advisorKey, isHired] of playerState.advisors) {
-                if (isHired) {
-                    const advisor = ADVISORS[advisorKey];
-                    if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary;
-                    if (advisor.upkeep.effects) {
-                        for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat];
-                    }
+            for (const [advisorKey, isHired] of playerState.advisors) { if (isHired) { const advisor = ADVISORS[advisorKey]; if (advisor.upkeep.salary) totalSalary += advisor.upkeep.salary; if (advisor.upkeep.effects) { for (const stat in advisor.upkeep.effects) playerState[stat] += advisor.upkeep.effects[stat]; } } }
+            playerState.treasury -= totalSalary;
+            const jailUpkeep = Math.floor((playerState.jailedPopulation || 0) * 0.5);
+            playerState.treasury -= jailUpkeep;
+
+            // --- Prisoner Release Logic ---
+            let prisoners = playerState.flags.get('prisoners') || [];
+            const remainingPrisoners = [];
+            let releasedCount = 0;
+            for (const group of prisoners) {
+                if (playerState.day >= group.releaseDay) {
+                    playerState.population += group.count;
+                    playerState.jailedPopulation -= group.count;
+                    releasedCount += group.count;
+                } else {
+                    remainingPrisoners.push(group);
                 }
             }
-            playerState.treasury -= totalSalary;
+            if (releasedCount > 0) {
+                replies.push(`⛓️ ${releasedCount} prisoners have served their time and been released back into the populace.`);
+                playerState.flags.set('prisoners', remainingPrisoners);
+            }
+            if (playerState.jailedPopulation < 0) playerState.jailedPopulation = 0; // Failsafe
 
             let upkeepReport = [];
             if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
-            if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
+            if (playerState.population !== oldStats.population || playerState.jailedPopulation !== oldStats.jailedPopulation) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
             if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
             if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
             if (upkeepReport.length > 0) replies.push(`📈 Daily changes for ${playerName}: ${upkeepReport.join(' | ')}`);
+            if (jailUpkeep > 0) replies.push(`⛓️ The upkeep for your ${playerState.jailedPopulation} prisoners costs ${jailUpkeep} 💰.`);
 
             if (playerState.happiness <= REVOLT_HAPPINESS_THRESHOLD && playerState.taxRate !== 'low') {
                 replies.push(`🚨 WARNING: Happiness in ${playerName}'s kingdom is critically low!`);
@@ -239,80 +267,32 @@ async function requestNextChat(playerName) {
              playerState.day = 1;
         }
         
-        // --- Generate new events for the day (with unique check) ---
         playerState.eventsForToday = [];
         playerState.currentEventIndex = 0;
         const dailyEventCounts = new Map();
         const numberOfEvents = Math.floor(Math.random() * 3) + 3;
         const uniqueEventsThisDay = new Set();
-
-        for (let i = 0; i < numberOfEvents; i++) {
-            const availableEvents = allEvents.filter(e => {
-                const count = dailyEventCounts.get(e.id) || 0;
-                if (count >= 2) return false;
-                if (e.isUnique && uniqueEventsThisDay.has(e.id)) return false;
-
-                const condition = e.condition ? e.condition(playerState) : true;
-                const seasonCondition = e.season ? e.season === playerState.season : true;
-                let advisorCondition = true;
-                if (e.advisor) advisorCondition = playerState.advisors.get(e.advisor);
-                else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor);
-                return condition && seasonCondition && advisorCondition;
-            });
-            if (availableEvents.length === 0) break;
-            const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)];
-            playerState.eventsForToday.push(chosenEvent.id);
-            dailyEventCounts.set(chosenEvent.id, (dailyEventCounts.get(chosenEvent.id) || 0) + 1);
-            if (chosenEvent.isUnique) {
-                uniqueEventsThisDay.add(chosenEvent.id);
-            }
-        }
+        for (let i = 0; i < numberOfEvents; i++) { const availableEvents = allEvents.filter(e => { const count = dailyEventCounts.get(e.id) || 0; if (count >= 2) return false; if (e.isUnique && uniqueEventsThisDay.has(e.id)) return false; const condition = e.condition ? e.condition(playerState) : true; const seasonCondition = e.season ? e.season === playerState.season : true; let advisorCondition = true; if (e.advisor) advisorCondition = playerState.advisors.get(e.advisor); else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor); return condition && seasonCondition && advisorCondition; }); if (availableEvents.length === 0) break; const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)]; playerState.eventsForToday.push(chosenEvent.id); dailyEventCounts.set(chosenEvent.id, (dailyEventCounts.get(chosenEvent.id) || 0) + 1); if (chosenEvent.isUnique) { uniqueEventsThisDay.add(chosenEvent.id); } }
         
         const princeEventAvailable = playerState.eventsForToday.includes('prince_loan_offer');
-        if (playerState.treasury < 0 && !princeEventAvailable) {
-            return destroyKingdom(playerName, "The kingdom is bankrupt!");
-        }
-        if (playerState.happiness <= 0) {
-            return destroyKingdom(playerName, "The people have revolted!");
-        }
-
-        if (playerState.eventsForToday.length === 0) {
-            replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} ---`);
-            replies.push("The kingdom is quiet today. 😌 No new petitions have arrived.");
-            replies.push("Type !chat to start the next day.");
-            await playerState.save();
-            return replies;
-        }
+        if (playerState.treasury < 0 && !princeEventAvailable) { return destroyKingdom(playerName, "The kingdom is bankrupt!"); }
+        if (playerState.happiness <= 0) { return destroyKingdom(playerName, "The people have revolted!"); }
+        if (playerState.eventsForToday.length === 0) { replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} ---`); replies.push("The kingdom is quiet today. 😌 No new petitions have arrived."); replies.push("Type !chat to start the next day."); await playerState.save(); return replies; }
     }
 
     const eventId = playerState.eventsForToday[playerState.currentEventIndex];
     const currentEvent = eventsMap.get(eventId);
-
-    if (!currentEvent) {
-        playerState.currentEventIndex++;
-        await playerState.save();
-        return requestNextChat(playerName);
-    }
-
+    if (!currentEvent) { playerState.currentEventIndex++; await playerState.save(); return requestNextChat(playerName); }
     playerState.currentEventId = currentEvent.id;
     playerState.isAwaitingDecision = true;
     await playerState.save();
-
     const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner() : currentEvent.petitioner;
     const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
-
     replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} (Event ${playerState.currentEventIndex + 1}/${playerState.eventsForToday.length}) ---`);
     replies.push(`${petitioner} 🗣️ wants to talk.`);
     replies.push(`"${eventText}"`);
-    
-    if (currentEvent.isNarrativeOnly) {
-        playerState.isAwaitingDecision = false;
-        const resolutionReplies = await handleDecision(playerName, '!narrative');
-        return replies.concat(resolutionReplies);
-    }
-
+    if (currentEvent.isNarrativeOnly) { playerState.isAwaitingDecision = false; const resolutionReplies = await handleDecision(playerName, '!narrative'); return replies.concat(resolutionReplies); }
     replies.push("What do you say? 🤔 (!yes / !no)");
-
     return replies;
 }
 
@@ -321,84 +301,29 @@ async function handleDecision(playerName, choice) {
     if (!playerState || !playerState.gameActive || (playerState.isAwaitingDecision === false && choice !== '!narrative')) return [];
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
     const currentEvent = eventsMap.get(playerState.currentEventId);
-    if (!currentEvent) {
-        playerState.isAwaitingDecision = false;
-        playerState.currentEventIndex++;
-        await playerState.save();
-        return ["An error occurred with your current event. Type !chat to continue."];
-    }
+    if (!currentEvent) { playerState.isAwaitingDecision = false; playerState.currentEventIndex++; await playerState.save(); return ["An error occurred with your current event. Type !chat to continue."]; }
 
     const oldStats = { ...playerState.toObject() };
     const replies = [];
-
     let chosenOutcome;
-    if (choice === '!narrative' && currentEvent.isNarrativeOnly) {
-        chosenOutcome = currentEvent;
-        replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`);
-    } else {
-        const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
-        chosenOutcome = currentEvent[decisionKey];
-        if (!chosenOutcome) { return ["That is not a valid choice for this event."]; }
-        replies.push(`💬 ${playerName}, ${chosenOutcome.text}`);
-    }
+    if (choice === '!narrative' && currentEvent.isNarrativeOnly) { chosenOutcome = currentEvent; replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`); }
+    else { const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo'; chosenOutcome = currentEvent[decisionKey]; if (!chosenOutcome) { return ["That is not a valid choice for this event."]; } replies.push(`💬 ${playerName}, ${chosenOutcome.text}`); }
 
     if (chosenOutcome.triggersGameOver) { return destroyKingdom(playerName, chosenOutcome.text); }
-
-    if (chosenOutcome.random_outcomes) {
-        const roll = Math.random();
-        let cumulativeChance = 0;
-        for (const outcome of chosenOutcome.random_outcomes) {
-            cumulativeChance += outcome.chance;
-            if (roll < cumulativeChance) {
-                replies.push(`🎲 ${outcome.text}`);
-                if (outcome.effects) {
-                    for (const stat in outcome.effects) {
-                        if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat];
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    if (chosenOutcome.effects) {
-        for (const stat in chosenOutcome.effects) {
-            if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat];
-        }
-    }
+    if (chosenOutcome.random_outcomes) { const roll = Math.random(); let cumulativeChance = 0; for (const outcome of chosenOutcome.random_outcomes) { cumulativeChance += outcome.chance; if (roll < cumulativeChance) { replies.push(`🎲 ${outcome.text}`); if (outcome.effects) { for (const stat in outcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat]; } } break; } } }
+    if (chosenOutcome.effects) { for (const stat in chosenOutcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat]; } }
     if (chosenOutcome.onSuccess) { chosenOutcome.onSuccess(playerState); }
-
-    if (chosenOutcome.clearFlags) {
-        chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
-    }
+    if (chosenOutcome.clearFlags) { chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag)); }
 
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
     playerState.currentEventIndex++;
-
     await playerState.save();
-
-    let statusChanges = [];
-    const allEffectKeys = new Set(Object.keys(chosenOutcome.effects || {}));
-    if (chosenOutcome.random_outcomes) {
-        chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.add(k)));
-    }
-    for (const stat of allEffectKeys) {
-        if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) {
-            statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
-        }
-    }
-    if (statusChanges.length > 0) replies.push(`📊 Stat Changes: ${statusChanges.join(' | ')}`);
-    
-    if (playerState.currentEventIndex >= playerState.eventsForToday.length) {
-        replies.push("The day's business is concluded. ✅ Type !chat to start the next day.");
-    } else {
-        replies.push("A new petitioner approaches. 👉 Type !chat for your next event.");
-    }
-    
+    let statusChanges = []; const allEffectKeys = new Set(Object.keys(chosenOutcome.effects || {})); if (chosenOutcome.random_outcomes) { chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.add(k))); } for (const stat of allEffectKeys) { if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) { statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat])); } } if (statusChanges.length > 0) replies.push(`📊 Stat Changes: ${statusChanges.join(' | ')}`);
+    if (playerState.currentEventIndex >= playerState.eventsForToday.length) { replies.push("The day's business is concluded. ✅ Type !chat to start the next day."); }
+    else { replies.push("A new petitioner approaches. 👉 Type !chat for your next event."); }
     return replies;
 }
-
 
 async function handleSetTax(playerName, newRate) {
     const playerState = await Kingdom.findById(playerName);
@@ -414,6 +339,9 @@ async function handleSetTax(playerName, newRate) {
 
 function formatStatChange(stat, oldValue, newValue) {
     const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '💂' };
+    if (stat === 'population' && 'jailedPopulation' in newValue) { // A bit of a hack for upkeep report
+        return `${symbols.population} ${oldValue.population} ➞ ${newValue.population} | ⛓️ ${oldValue.jailedPopulation} ➞ ${newValue.jailedPopulation}`;
+    }
     return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
 }
 
@@ -421,18 +349,9 @@ async function showStatus(playerName) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to begin.`];
     let advisorList = 'None';
-    if (playerState.advisors && playerState.advisors.size > 0) {
-        const hiredAdvisors = [];
-        for (const [key, isHired] of playerState.advisors.entries()) {
-            if (isHired) {
-                hiredAdvisors.push(ADVISORS[key].name);
-            }
-        }
-        if (hiredAdvisors.length > 0) {
-            advisorList = hiredAdvisors.join(', ');
-        }
-    }
-    return [
+    if (playerState.advisors && playerState.advisors.size > 0) { const hiredAdvisors = []; for (const [key, isHired] of playerState.advisors.entries()) { if (isHired) { hiredAdvisors.push(ADVISORS[key].name); } } if (hiredAdvisors.length > 0) { advisorList = hiredAdvisors.join(', '); } }
+    
+    const status = [
         `--- ${playerName}'s Kingdom Status (Day ${playerState.day}) ---`,
         `💰 Treasury: ${playerState.treasury}`, 
         `😊 Happiness: ${playerState.happiness}`,
@@ -442,6 +361,10 @@ async function showStatus(playerName) {
         `🌸 Season: ${playerState.season}`,
         `👑 Council: ${advisorList}`
     ];
+    if (playerState.jailedPopulation > 0) {
+        status.splice(4, 0, `⛓️ Jailed Population: ${playerState.jailedPopulation}`);
+    }
+    return status;
 }
 
 function showHelp() {
