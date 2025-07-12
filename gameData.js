@@ -1,8 +1,10 @@
 // gameData.js
 
 // --- CHANGE LOG ---
-// 1. ADDED: New character "Eye of Wisdom" with a high-stakes random event.
-// 2. All previous systems (Skelly, Fallen Noble, Crime & Punishment, etc.) are preserved.
+// 1. ADDED: New characters "Eye of Wisdom" and "Skelly" with unique random events.
+// 2. ADDED: New "Fallen Noble" quest chain with long-term consequences.
+// 3. ADDED: New character-building event for "The Whisper" (Spymaster).
+// 4. All previous systems (Crime & Punishment, Ball & Cat, etc.) are preserved and up-to-date.
 // --- END CHANGE LOG ---
 
 
@@ -33,14 +35,14 @@ const ADVISORS = {
 const EVENT_COOLDOWN_DAYS = 30;
 
 const allEvents = [
-    // --- NEW: Eye of Wisdom Event ---
+    // --- Eye of Wisdom Event ---
     {
         id: 'eye_of_wisdom_encounter',
         petitioner: "A Giant, Floating Eyeball",
         text: "A colossal, unblinking eyeball has manifested in the center of your throne room. It swivels slowly, focusing its gaze directly on you. Its silent stare is unnerving... shall you call the guards to drive it away?",
         onYes: {
             text: "At your command, the guards cautiously approach the eyeball with spears leveled. Without a sound, it fades from existence, leaving only a lingering sense of being watched.",
-            effects: {} // Nothing gained, nothing lost.
+            effects: {}
         },
         onNo: {
             text: "You hold up a hand, motioning for the guards to stand down. You meet the creature's gaze, allowing it to continue its silent observation.",
@@ -53,10 +55,8 @@ const allEvents = [
                 {
                     chance: 0.5,
                     text: "The eyeball's pupil dilates into a void of darkness. You feel a dreadful emptiness in your coffers, as if a portion of your wealth was just... erased from existence. The Eye of Wisdom has judged you unfortunate today.",
-                    effects: {}, // The effect is handled by the custom onSuccess logic below
                     onSuccess: (gs) => {
-                        // Calculate a random percentage loss between 25% and 50%
-                        const percentLoss = (Math.random() * 0.25) + 0.25; // Random number 0.25 to 0.50
+                        const percentLoss = (Math.random() * 0.25) + 0.25;
                         const amountLost = Math.floor(gs.treasury * percentLoss);
                         gs.treasury -= amountLost;
                     }
@@ -149,28 +149,6 @@ const allEvents = [
                 }
             }
         ]
-    },
-    {
-        id: 'spymaster_fallen_noble_plot',
-        advisor: 'spymaster',
-        isUnique: true,
-        condition: (gs) => gs.flags.has('rejected_fallen_noble'),
-        petitioner: () => ADVISORS.spymaster.name,
-        text: "A whisper... The fallen noble you turned away has gathered his disenfranchised kin out of spite. They plot against you. For 25 gold, I can 'discourage' them.",
-        onYes: {
-            text: "The problem is dealt with. The nobles' dissent is silenced, but your act of suppression inspires no one.",
-            effects: { treasury: -25 },
-            onSuccess: (gs) => {
-                gs.flags.delete('rejected_fallen_noble');
-            }
-        },
-        onNo: {
-            text: "You let them be. Their hateful whispers spread, and dissent grows.",
-            effects: { happiness: -15 },
-            onSuccess: (gs) => {
-                gs.flags.delete('rejected_fallen_noble');
-            }
-        }
     },
     
     // --- Crime & Punishment System ---
@@ -265,7 +243,58 @@ const allEvents = [
         outcome_text: "You thank Lady Elara for her grim but necessary accounting.",
         effects: { treasury: -10 }
     },
-    //... The rest of your existing events go below this line
+    
+    // --- Advisor Events ---
+    { id: 'recruit_general', petitioner: "A battle-scarred soldier", text: "My liege, our army is disorganized. For a salary, the legendary General Kael could lead our troops.", requiresNoAdvisor: 'general', onYes: { text: "General Kael accepts your offer.", effects: { military: +10 }, onSuccess: (gs) => { gs.advisors.set('general', true); } }, onNo: { text: "You decline. The army remains a rudderless ship.", effects: { happiness: -5 } } },
+    { id: 'recruit_treasurer', petitioner: "A guild merchant", text: "Your Majesty, the economy is a tangled mess. Lady Elara's services are costly, but she can make tax collection 10% more effective.", requiresNoAdvisor: 'treasurer', condition: (gs) => gs.treasury > 200, onYes: { text: "Lady Elara joins your council.", effects: {}, onSuccess: (gs) => { gs.advisors.set('treasurer', true); } }, onNo: { text: "You decide your current methods are sufficient.", effects: {} } },
+    { id: 'recruit_spymaster', petitioner: "A cloaked figure", text: "Knowledge is power, your Majesty. Secrets are a weapon. I can be your weapon... for a price.", requiresNoAdvisor: 'spymaster', onYes: { text: "The figure nods. 'My whispers will serve you.'", effects: {}, onSuccess: (gs) => { gs.advisors.set('spymaster', true); } }, onNo: { text: "The figure melts back into the shadows.", effects: {} } },
+    { id: 'general_report', advisor: 'general', petitioner: () => ADVISORS.general.name, text: (gs) => `My liege, our military strength is ${gs.military}. I request 50 gold for training exercises.`, onYes: { text: "The training exercises are a success!", effects: { treasury: -50, military: +15 } }, onNo: { text: "'As you command,' the General says, disappointed.", effects: { happiness: -5 } } },
+    {
+        id: 'spymaster_spooky_name',
+        petitioner: () => ADVISORS.spymaster.name,
+        advisor: 'spymaster',
+        isUnique: true,
+        condition: (gs) => gs.advisors.get('spymaster'),
+        text: "I have observed... that you lack a sufficiently intimidating moniker. Would you care for a... spooky name?",
+        onYes: {
+            text: "You nod. The Whisper seems pleased and leans in to share his idea.",
+            effects: { happiness: +5 },
+            onSuccess: (gs) => {
+                const spookyNames = ["The Shadow Monarch", "The Veiled Sovereign", "The Ghost-Who-Rules", "The Midnight Regent", "Lord of Whispers", "The Silent Tyrant"];
+                const chosenName = spookyNames[Math.floor(Math.random() * spookyNames.length)];
+                gs.outcome_text = `From this day forward, the whispers in the dark will call you... ${chosenName}.`;
+            }
+        },
+        onNo: {
+            text: "'A pity,' The Whisper hisses, melting back into the shadows. 'My apologies for wasting your time.' He leaves a small pouch of coins on the armrest.",
+            effects: { treasury: +5 }
+        }
+    },
+    {
+        id: 'spymaster_fallen_noble_plot',
+        advisor: 'spymaster',
+        isUnique: true,
+        condition: (gs) => gs.flags.has('rejected_fallen_noble'),
+        petitioner: () => ADVISORS.spymaster.name,
+        text: "A whisper... The fallen noble you turned away has gathered his disenfranchised kin out of spite. They plot against you. For 25 gold, I can 'discourage' them.",
+        onYes: {
+            text: "The problem is dealt with. The nobles' dissent is silenced, but your act of suppression inspires no one.",
+            effects: { treasury: -25 },
+            onSuccess: (gs) => {
+                gs.flags.delete('rejected_fallen_noble');
+            }
+        },
+        onNo: {
+            text: "You let them be. Their hateful whispers spread, and dissent grows.",
+            effects: { happiness: -15 },
+            onSuccess: (gs) => {
+                gs.flags.delete('rejected_fallen_noble');
+            }
+        }
+    },
+    { id: 'spymaster_report', advisor: 'spymaster', petitioner: () => ADVISORS.spymaster.name, text: "A whisper... A noble family plots against you. For 25 gold, I can... 'discourage' them.", condition: (gs) => !gs.flags.has('rejected_fallen_noble'), onYes: { text: "The problem is dealt with. The nobles are suddenly very loyal.", effects: { treasury: -25, happiness: +10 } }, onNo: { text: "You let them be. Dissent grows.", effects: { happiness: -15 } } },
+    
+    // --- Other Events ---
     {
         id: 'grandma_coffee',
         petitioner: "An Old Grandma",
@@ -401,11 +430,6 @@ const allEvents = [
         effects: { population: +10, happiness: +10 },
         clearFlags: ['lied_to_cat']
     },
-    { id: 'recruit_general', petitioner: "A battle-scarred soldier", text: "My liege, our army is disorganized. For a salary, the legendary General Kael could lead our troops.", requiresNoAdvisor: 'general', onYes: { text: "General Kael accepts your offer.", effects: { military: +10 }, onSuccess: (gs) => { gs.advisors.set('general', true); } }, onNo: { text: "You decline. The army remains a rudderless ship.", effects: { happiness: -5 } } },
-    { id: 'recruit_treasurer', petitioner: "A guild merchant", text: "Your Majesty, the economy is a tangled mess. Lady Elara's services are costly, but she can make tax collection 10% more effective.", requiresNoAdvisor: 'treasurer', condition: (gs) => gs.treasury > 200, onYes: { text: "Lady Elara joins your council.", effects: {}, onSuccess: (gs) => { gs.advisors.set('treasurer', true); } }, onNo: { text: "You decide your current methods are sufficient.", effects: {} } },
-    { id: 'recruit_spymaster', petitioner: "A cloaked figure", text: "Knowledge is power, your Majesty. Secrets are a weapon. I can be your weapon... for a price.", requiresNoAdvisor: 'spymaster', onYes: { text: "The figure nods. 'My whispers will serve you.'", effects: {}, onSuccess: (gs) => { gs.advisors.set('spymaster', true); } }, onNo: { text: "The figure melts back into the shadows.", effects: {} } },
-    { id: 'general_report', advisor: 'general', petitioner: () => ADVISORS.general.name, text: (gs) => `My liege, our military strength is ${gs.military}. I request 50 gold for training exercises.`, onYes: { text: "The training exercises are a success!", effects: { treasury: -50, military: +15 } }, onNo: { text: "'As you command,' the General says, disappointed.", effects: { happiness: -5 } } },
-    { id: 'spymaster_report', advisor: 'spymaster', petitioner: () => ADVISORS.spymaster.name, text: "A whisper... A noble family plots against you. For 25 gold, I can... 'discourage' them.", onYes: { text: "The problem is dealt with. The nobles are suddenly very loyal.", effects: { treasury: -25, happiness: +10 } }, onNo: { text: "You let them be. Dissent grows.", effects: { happiness: -15 } } },
     { id: 'farmer_blight', petitioner: "A Farmer", text: "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds.", onYes: { text: "The farmers are grateful! They promise to remember your generosity.", effects: { treasury: -50, happiness: +15 }, onSuccess: (gs) => { gs.flags.set('helped_farmer_blight', gs.day); } }, onNo: { text: "The farmers despair.", effects: { happiness: -15, population: -10 } } },
     { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", isUnique: true, condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
     { id: 'shady_merchant', petitioner: "A Shady Merchant", text: "Psst... a small investment of 20 gold could double your return!", onYes: { text: "The gamble pays off!", effects: { treasury: +20 }, onSuccess: (gs) => { gs.flags.set('trusted_shady_merchant', true); } }, onNo: { text: "You wisely refuse.", effects: { happiness: +5 } } },
