@@ -1,9 +1,8 @@
 // gameData.js
 
 // --- CHANGE LOG ---
-// 1. ADDED: New "Fallen Noble" quest chain, a multi-day event with a 50/50 outcome and consequences that affect other events.
-// 2. ADDED: A special version of the Spymaster's report that can only trigger if the player refuses to help the Fallen Noble.
-// 3. All previous systems (Crime & Punishment, Ball & Cat, etc.) are preserved.
+// 1. ADDED: New character "Eye of Wisdom" with a high-stakes random event.
+// 2. All previous systems (Skelly, Fallen Noble, Crime & Punishment, etc.) are preserved.
 // --- END CHANGE LOG ---
 
 
@@ -34,14 +33,68 @@ const ADVISORS = {
 const EVENT_COOLDOWN_DAYS = 30;
 
 const allEvents = [
-    // --- NEW: Fallen Noble Quest Chain ---
+    // --- NEW: Eye of Wisdom Event ---
+    {
+        id: 'eye_of_wisdom_encounter',
+        petitioner: "A Giant, Floating Eyeball",
+        text: "A colossal, unblinking eyeball has manifested in the center of your throne room. It swivels slowly, focusing its gaze directly on you. Its silent stare is unnerving... shall you call the guards to drive it away?",
+        onYes: {
+            text: "At your command, the guards cautiously approach the eyeball with spears leveled. Without a sound, it fades from existence, leaving only a lingering sense of being watched.",
+            effects: {} // Nothing gained, nothing lost.
+        },
+        onNo: {
+            text: "You hold up a hand, motioning for the guards to stand down. You meet the creature's gaze, allowing it to continue its silent observation.",
+            random_outcomes: [
+                {
+                    chance: 0.5,
+                    text: "The eyeball blinks once, slowly. A shower of shimmering gold coins materializes from thin air and rains down around your throne! The Eye of Wisdom has judged you fortunate today.",
+                    effects: { treasury: +300 }
+                },
+                {
+                    chance: 0.5,
+                    text: "The eyeball's pupil dilates into a void of darkness. You feel a dreadful emptiness in your coffers, as if a portion of your wealth was just... erased from existence. The Eye of Wisdom has judged you unfortunate today.",
+                    effects: {}, // The effect is handled by the custom onSuccess logic below
+                    onSuccess: (gs) => {
+                        // Calculate a random percentage loss between 25% and 50%
+                        const percentLoss = (Math.random() * 0.25) + 0.25; // Random number 0.25 to 0.50
+                        const amountLost = Math.floor(gs.treasury * percentLoss);
+                        gs.treasury -= amountLost;
+                    }
+                }
+            ]
+        }
+    },
+
+    // --- Skelly Events ---
+    {
+        id: 'skelly_joke',
+        petitioner: "A cheerful-looking skeleton",
+        text: "Wanna hear a joke?",
+        condition: (gs) => gs.treasury >= 150,
+        onYes: {
+            text: "Why didn't the skeleton cross the road? He didn't have the guts! He takes 150 gold for his performance.",
+            effects: { treasury: -150, happiness: +10 }
+        },
+        onNo: {
+            text: "He shrugs his bony shoulders and wanders off.",
+            effects: {}
+        }
+    },
+    {
+        id: 'skelly_boo',
+        petitioner: "A skeleton pops out from behind a tapestry",
+        text: "Boo!",
+        isNarrativeOnly: true,
+        outcome_text: "He cackles madly and then vanishes as quickly as he appeared, leaving you and your court slightly unnerved.",
+        effects: { happiness: -3 }
+    },
+    
+    // --- Fallen Noble Quest Chain ---
     {
         id: 'fallen_noble_plea',
         petitioner: "A Desperate Fallen Noble",
         text: (gs) => {
-            // Generate the random amount of gold needed for this specific event instance.
-            // We'll store it on the game state temporarily so the onSuccess can access the same value.
-            gs.temp_noble_gold = Math.floor(Math.random() * 151) + 100; // Random number 100-250
+            gs.temp_noble_gold = Math.floor(Math.random() * 151) + 100;
             return `My lord, my family has lost everything. May I have ${gs.temp_noble_gold} 💰, 20 💂, and 30 👨‍👩‍👧‍👦 to help us relocate? We will find a way to repay you someday, I swear it.`;
         },
         isUnique: true,
@@ -50,12 +103,12 @@ const allEvents = [
             text: "He falls to one knee, overcome with gratitude. 'You will not regret this, my lord.' He takes the resources and leaves with renewed hope.",
             effects: { happiness: +5 },
             onSuccess: (gs) => {
-                const goldAmount = gs.temp_noble_gold || 250; // Use the temp value, with a fallback
+                const goldAmount = gs.temp_noble_gold || 250;
                 gs.treasury -= goldAmount;
                 gs.military -= 20;
                 gs.population -= 30;
                 gs.flags.set('helped_fallen_noble', { day: gs.day, goldGiven: goldAmount });
-                delete gs.temp_noble_gold; // Clean up temp value
+                delete gs.temp_noble_gold;
             }
         },
         onNo: {
@@ -63,7 +116,7 @@ const allEvents = [
             effects: { happiness: -5 },
             onSuccess: (gs) => {
                 gs.flags.set('rejected_fallen_noble', true);
-                delete gs.temp_noble_gold; // Clean up temp value
+                delete gs.temp_noble_gold;
             }
         }
     },
@@ -79,9 +132,9 @@ const allEvents = [
                 outcome_text: "The noble you aided has returned! 'My lord, thank you for your helping hand. My family is safe, and we devote our cause to you.' He returns your soldiers, new followers, and a portion of the funds.",
                 onSuccess: (gs) => {
                     const nobleData = gs.flags.get('helped_fallen_noble');
-                    gs.population += 30; // 30 new followers
-                    gs.military += 30;   // Your 20 soldiers return, plus 10 of his own men
-                    gs.treasury += Math.floor(nobleData.goldGiven / 2); // Half the gold is returned
+                    gs.population += 30;
+                    gs.military += 30;
+                    gs.treasury += Math.floor(nobleData.goldGiven / 2);
                     gs.happiness += 10;
                     gs.flags.delete('helped_fallen_noble');
                 }
@@ -106,7 +159,7 @@ const allEvents = [
         text: "A whisper... The fallen noble you turned away has gathered his disenfranchised kin out of spite. They plot against you. For 25 gold, I can 'discourage' them.",
         onYes: {
             text: "The problem is dealt with. The nobles' dissent is silenced, but your act of suppression inspires no one.",
-            effects: { treasury: -25 }, // As requested, no happiness gain.
+            effects: { treasury: -25 },
             onSuccess: (gs) => {
                 gs.flags.delete('rejected_fallen_noble');
             }
@@ -130,7 +183,7 @@ const allEvents = [
         onYes: {
             text: "You order the arrests. Your guards move to enforce the law.",
             onSuccess: (gs) => {
-                const percentToJail = (Math.random() * 0.05) + 0.10; // 10-15%
+                const percentToJail = (Math.random() * 0.05) + 0.10;
                 const numCriminals = Math.floor(gs.population * percentToJail);
                 const maxArrestable = gs.military * 3;
 
