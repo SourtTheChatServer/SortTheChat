@@ -1,11 +1,9 @@
 // gameData.js
 
 // --- CHANGE LOG ---
-// 1. REWORKED: The "Ball and Cat" quest chain.
-// 2. ADDED: New high-risk "Tempting Offer" events.
-// 3. UPDATED: The "goblin_raid" event with random outcomes.
-// 4. FIXED: The "kid_adventure_return" event choice.
-// 5. BUG FIX: Added `isUnique: true` to the 'prince_loan_collection' event to prevent it from firing multiple times per day.
+// 1. ADDED: Full "Crime & Punishment" system with military enforcement checks and new character-driven follow-up events.
+// 2. REWORKED: The "Ball and Cat" quest chain to be narrative-driven.
+// 3. BUG FIX: Added `isUnique: true` to all critical, chained, and story events to prevent them from firing multiple times per day.
 // --- END CHANGE LOG ---
 
 
@@ -36,7 +34,104 @@ const ADVISORS = {
 const EVENT_COOLDOWN_DAYS = 30;
 
 const allEvents = [
-    // --- User-Requested Events ---
+    // --- Crime & Punishment System ---
+    {
+        id: 'crime_wave',
+        petitioner: "The Guard Captain",
+        text: (gs) => `Sir, with happiness at a dismal ${gs.happiness}, a crime wave has erupted! We've caught several citizens robbing their neighbors. Shall we imprison them to make an example, or show mercy?`,
+        isUnique: true,
+        condition: (gs) => gs.happiness < 30,
+        onYes: {
+            text: "You order the arrests. Your guards move to enforce the law.",
+            onSuccess: (gs) => {
+                const percentToJail = (Math.random() * 0.05) + 0.10; // 10-15%
+                const numCriminals = Math.floor(gs.population * percentToJail);
+                const maxArrestable = gs.military * 3; // 1 soldier handles 3 criminals
+
+                if (maxArrestable >= numCriminals) {
+                    // Total Success
+                    gs.outcome_text = "The operation is a complete success! All ringleaders are jailed.";
+                    gs.population -= numCriminals;
+                    gs.jailedPopulation = (gs.jailedPopulation || 0) + numCriminals;
+                    gs.happiness += 10;
+                    
+                    let prisoners = gs.flags.get('prisoners') || [];
+                    prisoners.push({ count: numCriminals, releaseDay: gs.day + 2 });
+                    gs.flags.set('prisoners', prisoners);
+                    gs.flags.delete('active_crime_gang'); // Disband any existing gang
+                } else {
+                    // Partial Success
+                    gs.outcome_text = "Your military is stretched thin! The guards manage to capture some criminals, but many slip through the net, angered and organized.";
+                    const numArrested = Math.floor(maxArrestable);
+                    if (gs.population > numArrested) {
+                         gs.population -= numArrested;
+                         gs.jailedPopulation = (gs.jailedPopulation || 0) + numArrested;
+                    }
+                    gs.happiness += 5;
+
+                    let prisoners = gs.flags.get('prisoners') || [];
+                    prisoners.push({ count: numArrested, releaseDay: gs.day + 2 });
+                    gs.flags.set('prisoners', prisoners);
+                    gs.flags.set('active_crime_gang', true); // The rest form a gang
+                }
+            }
+        },
+        onNo: {
+            text: "You show mercy, but the criminals are emboldened. They form a gang and will continue to steal from the populace until they are dealt with.",
+            effects: { happiness: -20, treasury: -100 },
+            onSuccess: (gs) => {
+                gs.flags.set('active_crime_gang', true);
+            }
+        }
+    },
+    {
+        id: 'black_market_emerges',
+        petitioner: () => ADVISORS.spymaster.name,
+        text: "My liege, my whispers have found a black market flourishing in the slums. It is run by the gang you spared. They sell stolen goods, which makes some of the populace happy, but it directly undermines our tax base and stability. What are your orders?",
+        isUnique: true,
+        advisor: 'spymaster',
+        condition: (gs) => gs.flags.has('active_crime_gang'),
+        onYes: {
+            text: "You allow the market to operate, for now. The influx of cheap goods pleases the masses, but the gang becomes more entrenched, and their thievery grows more efficient.",
+            effects: { happiness: +15 },
+            onSuccess: (gs) => {
+                gs.flags.set('active_crime_gang', 'entrenched'); 
+            }
+        },
+        onNo: {
+            text: "You order a raid. Your soldiers smash the stalls and scatter the criminals. You have asserted your authority, but the people who relied on that market are now angry and without supplies.",
+            effects: { happiness: -15, military: -5 }
+        }
+    },
+    {
+        id: 'jails_overflowing',
+        petitioner: "The Guard Captain",
+        text: (gs) => `Sir, the jails are overflowing with the ${gs.jailedPopulation} souls we imprisoned. The upkeep is a constant drain, and the guards are stretched thin watching them. This is not a sustainable solution.`,
+        isNarrativeOnly: true,
+        isUnique: true,
+        condition: (gs) => (gs.jailedPopulation || 0) > 20,
+        outcome_text: "You nod, acknowledging the captain's valid concerns. The cost of justice is high indeed.",
+        effects: { happiness: -2 }
+    },
+    {
+        id: 'treasurer_crime_report',
+        petitioner: () => ADVISORS.treasurer.name,
+        text: (gs) => {
+            if (gs.flags.has('active_crime_gang')) {
+                return "My liege, I must report on the economic disaster caused by this crime wave. Between the daily theft and the scared populace, our productivity is plummeting!";
+            } else {
+                return `My liege, the ledgers don't lie. With ${gs.jailedPopulation || 0} able-bodied workers sitting in jail, our tax income has taken a noticeable hit. We cannot afford this long-term.`;
+            }
+        },
+        isNarrativeOnly: true,
+        isUnique: true,
+        advisor: 'treasurer',
+        condition: (gs) => (gs.jailedPopulation || 0) > 15 || gs.flags.has('active_crime_gang'),
+        outcome_text: "You thank Lady Elara for her grim but necessary accounting. The numbers paint a bleak picture.",
+        effects: { treasury: -10 }
+    },
+
+    // --- Standard Events ---
     {
         id: 'grandma_coffee',
         petitioner: "An Old Grandma",
@@ -48,7 +143,7 @@ const allEvents = [
         id: 'prince_loan_offer',
         petitioner: "The Smug Prince of Almorg",
         text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 500 gold. I'll return for it in 10 days, of course.",
-        isUnique: true, // It makes sense for this offer to only appear once per day.
+        isUnique: true,
         condition: (gs) => gs.treasury <= 0 && !gs.flags.has('prince_is_enemy'),
         onYes: {
             text: "He smirks. 'A pleasure doing business.' Your kingdom is saved, for now.",
@@ -61,7 +156,7 @@ const allEvents = [
         id: 'prince_loan_collection',
         petitioner: "The Smug Prince of Almorg",
         text: "I've returned as promised for my 500 gold. I trust it's ready?",
-        isUnique: true, // This event can only be chosen once per day.
+        isUnique: true,
         condition: (gs) => gs.flags.has('loan_from_prince') && gs.day >= gs.flags.get('loan_from_prince') + 10,
         onYes: {
             text: "He counts the coins and nods. 'Until next time.' The debt is settled.",
@@ -122,39 +217,6 @@ const allEvents = [
             ]
         }
     },
-
-    // --- High-Risk, Tempting Events ---
-    {
-        id: 'living_chest_offer',
-        petitioner: "A Grotesque, Living Chest",
-        text: "It creaks open its single, bloodshot eye. A telepathic voice echoes in your mind: 'I hunger. You have... spare souls. I have... strength. Feed me 20 of your people, and I will grant your army impenetrable armor.'",
-        condition: (gs) => gs.military < 40 && gs.population > 50,
-        onYes: {
-            text: "The chest's lid flies open with a horrifying shriek. A chilling wind sweeps through the throne room. You feel a great, silent loss across the kingdom, but your barracks captain reports the armor of your soldiers now glows with a faint, unholy light.",
-            effects: { military: +35, population: -20, happiness: -25 }
-        },
-        onNo: {
-            text: "You banish the abhorrent creature. It slams its eye shut and vanishes, leaving only the faint smell of ozone. Your people are relieved by your righteous choice.",
-            effects: { happiness: +5 }
-        }
-    },
-    {
-        id: 'gilded_blight_offer',
-        petitioner: "A smiling man in a golden mask",
-        text: "Your people are so... morose. Unhappiness is a disease. I have the cure. For 150 gold, I can release a 'Golden Pollen' into the air. It will make everyone blissfully content. They will worry about nothing... not even work, or danger, or ambition.",
-        condition: (gs) => gs.happiness < 30,
-        onYes: {
-            text: "You agree. The man bows, and soon a shimmering golden dust settles over the kingdom. The incessant complaining stops. A placid calm descends upon your people.",
-            effects: { treasury: -150, happiness: +50 },
-            onSuccess: (gs) => { gs.flags.set('gilded_blight_active', true); } 
-        },
-        onNo: {
-            text: "You refuse to resort to such measures. The man's smile tightens, and he fades from view. Your problems remain, but so does your people's free will.",
-            effects: { happiness: +5 }
-        }
-    },
-
-    // --- Narrative Event Chain (The Ball and Cat Quest) ---
     {
         id: 'ball_hiding_plea',
         petitioner: "A muffled voice from under your throne",
@@ -205,15 +267,11 @@ const allEvents = [
         effects: { population: +10, happiness: +10 },
         clearFlags: ['lied_to_cat']
     },
-
-    // --- Advisor Events ---
     { id: 'recruit_general', petitioner: "A battle-scarred soldier", text: "My liege, our army is disorganized. For a salary, the legendary General Kael could lead our troops.", requiresNoAdvisor: 'general', onYes: { text: "General Kael accepts your offer.", effects: { military: +10 }, onSuccess: (gs) => { gs.advisors.set('general', true); } }, onNo: { text: "You decline. The army remains a rudderless ship.", effects: { happiness: -5 } } },
     { id: 'recruit_treasurer', petitioner: "A guild merchant", text: "Your Majesty, the economy is a tangled mess. Lady Elara's services are costly, but she can make tax collection 10% more effective.", requiresNoAdvisor: 'treasurer', condition: (gs) => gs.treasury > 200, onYes: { text: "Lady Elara joins your council.", effects: {}, onSuccess: (gs) => { gs.advisors.set('treasurer', true); } }, onNo: { text: "You decide your current methods are sufficient.", effects: {} } },
     { id: 'recruit_spymaster', petitioner: "A cloaked figure", text: "Knowledge is power, your Majesty. Secrets are a weapon. I can be your weapon... for a price.", requiresNoAdvisor: 'spymaster', onYes: { text: "The figure nods. 'My whispers will serve you.'", effects: {}, onSuccess: (gs) => { gs.advisors.set('spymaster', true); } }, onNo: { text: "The figure melts back into the shadows.", effects: {} } },
     { id: 'general_report', advisor: 'general', petitioner: () => ADVISORS.general.name, text: (gs) => `My liege, our military strength is ${gs.military}. I request 50 gold for training exercises.`, onYes: { text: "The training exercises are a success!", effects: { treasury: -50, military: +15 } }, onNo: { text: "'As you command,' the General says, disappointed.", effects: { happiness: -5 } } },
     { id: 'spymaster_report', advisor: 'spymaster', petitioner: () => ADVISORS.spymaster.name, text: "A whisper... A noble family plots against you. For 25 gold, I can... 'discourage' them.", onYes: { text: "The problem is dealt with. The nobles are suddenly very loyal.", effects: { treasury: -25, happiness: +10 } }, onNo: { text: "You let them be. Dissent grows.", effects: { happiness: -15 } } },
-
-    // --- Other Chained & Standard Events ---
     { id: 'farmer_blight', petitioner: "A Farmer", text: "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds.", onYes: { text: "The farmers are grateful! They promise to remember your generosity.", effects: { treasury: -50, happiness: +15 }, onSuccess: (gs) => { gs.flags.set('helped_farmer_blight', gs.day); } }, onNo: { text: "The farmers despair.", effects: { happiness: -15, population: -10 } } },
     { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", isUnique: true, condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
     { id: 'shady_merchant', petitioner: "A Shady Merchant", text: "Psst... a small investment of 20 gold could double your return!", onYes: { text: "The gamble pays off!", effects: { treasury: +20 }, onSuccess: (gs) => { gs.flags.set('trusted_shady_merchant', true); } }, onNo: { text: "You wisely refuse.", effects: { happiness: +5 } } },
