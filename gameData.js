@@ -1,19 +1,11 @@
 // gameData.js
 
 // --- CHANGE LOG ---
-// 1. UPDATED: "The Prince of Almorg" event chain.
-//    - Loan amount increased from 100 to 500 gold.
-//    - A new flag, 'prince_is_enemy', is now used.
-//    - Repaying the loan peacefully allows the prince to offer help again in the future.
-//    - Refusing to repay and fighting the prince sets the 'prince_is_enemy' flag, permanently cutting off future aid from him.
-// 2. UPDATED: "goblin_raid" event.
-//    - The 'onYes' (fight) option is now a gamble with multiple outcomes.
-//    - There is a 25% chance for a decisive victory that awards bonus treasure (gold or military armor).
-//    - There is a chance for a standard victory or an outright defeat.
-// 3. UPDATED: "kid_adventure_return" event.
-//    - The 'onNo' path now has a slightly different outcome to better reflect player choice.
-// 4. ADDED: New high-risk events ("The Living Chest", "The Gilded Blight").
-// 5. ADDED: New narrative event chain ("The Cat, the Ball, and the Ruler").
+// 1. REWORKED: The "Ball and Cat" quest chain.
+// 2. ADDED: New high-risk "Tempting Offer" events.
+// 3. UPDATED: The "goblin_raid" event with random outcomes.
+// 4. FIXED: The "kid_adventure_return" event choice.
+// 5. BUG FIX: Added `isUnique: true` to the 'prince_loan_collection' event to prevent it from firing multiple times per day.
 // --- END CHANGE LOG ---
 
 
@@ -56,6 +48,7 @@ const allEvents = [
         id: 'prince_loan_offer',
         petitioner: "The Smug Prince of Almorg",
         text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 500 gold. I'll return for it in 10 days, of course.",
+        isUnique: true, // It makes sense for this offer to only appear once per day.
         condition: (gs) => gs.treasury <= 0 && !gs.flags.has('prince_is_enemy'),
         onYes: {
             text: "He smirks. 'A pleasure doing business.' Your kingdom is saved, for now.",
@@ -68,6 +61,7 @@ const allEvents = [
         id: 'prince_loan_collection',
         petitioner: "The Smug Prince of Almorg",
         text: "I've returned as promised for my 500 gold. I trust it's ready?",
+        isUnique: true, // This event can only be chosen once per day.
         condition: (gs) => gs.flags.has('loan_from_prince') && gs.day >= gs.flags.get('loan_from_prince') + 10,
         onYes: {
             text: "He counts the coins and nods. 'Until next time.' The debt is settled.",
@@ -100,10 +94,10 @@ const allEvents = [
         onNo: { text: "The kid's face falls. He kicks a rock and trudges away.", effects: { happiness: -10 } }
     },
     {
-        // *** MODIFIED EVENT ***
         id: 'kid_adventure_return',
         petitioner: "The Guard Captain",
         text: "He's back! The kid has returned from his adventure, looking muddy but triumphant. Shall we see what he found?",
+        isUnique: true,
         condition: (gs) => gs.flags.has('kid_on_adventure') && gs.day >= gs.flags.get('kid_on_adventure') + 3,
         onYes: {
             text: "You welcome the young hero back!",
@@ -118,7 +112,7 @@ const allEvents = [
         },
         onNo: {
             text: "You offer a perfunctory greeting before inspecting the haul. The kid looks a little disappointed by your lack of enthusiasm.",
-            effects: { military: +10, happiness: -2 }, // Note: Differentiated effects
+            effects: { military: +10, happiness: -2 },
             clearFlags: ['kid_on_adventure'],
             random_outcomes: [
                 { chance: 0.03, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
@@ -129,7 +123,7 @@ const allEvents = [
         }
     },
 
-    // --- NEW: High-Risk, Tempting Events ---
+    // --- High-Risk, Tempting Events ---
     {
         id: 'living_chest_offer',
         petitioner: "A Grotesque, Living Chest",
@@ -152,7 +146,6 @@ const allEvents = [
         onYes: {
             text: "You agree. The man bows, and soon a shimmering golden dust settles over the kingdom. The incessant complaining stops. A placid calm descends upon your people.",
             effects: { treasury: -150, happiness: +50 },
-            // NOTE: For this flag to have a mechanical effect, a check must be added to the daily upkeep logic in server.js
             onSuccess: (gs) => { gs.flags.set('gilded_blight_active', true); } 
         },
         onNo: {
@@ -161,70 +154,56 @@ const allEvents = [
         }
     },
 
-    // --- NEW: Narrative Event Chain (Cat Quest) ---
+    // --- Narrative Event Chain (The Ball and Cat Quest) ---
     {
-        id: 'cat_quest_start',
-        petitioner: "A small, anxious-looking cat",
-        text: "Mrow... pardon, your Majesty. I seem to have misplaced my favorite ball. It's red, very bouncy, and answers to the name 'Sir Reginald.' Have you seen it?",
-        onYes: {
-            text: "The cat gives you a grateful slow-blink. 'Thank you, tall one. I will search the gardens again.'",
-            effects: {},
-            onSuccess: (gs) => { gs.flags.set('cat_quest_active', true); }
-        },
-        onNo: {
-            text: "The cat's ears droop. It lets out a sad little 'mew' and slinks away.",
-            effects: { happiness: -1 }
-        }
+        id: 'ball_hiding_plea',
+        petitioner: "A muffled voice from under your throne",
+        text: "hey im hiding away from that scary cat tryna put his dih inside of my holes dont tell him im here okay??",
+        isNarrativeOnly: true, 
+        isUnique: true,
+        outcome_text: "You silently acknowledge the... unusual plea from the terrified ball.",
+        onSuccess: (gs) => { gs.flags.set('knows_ball_location', true); }
     },
     {
-        id: 'cat_quest_ball_encounter',
-        petitioner: "A muffled voice from under your throne",
-        text: "Psst! You! The ruler! That cat sent you, didn't she? Don't tell her where I am! She's a tyrant! She bats me under armoires and dunks me in water bowls! I'm finally free! Please, lie to her!",
-        condition: (gs) => gs.flags.has('cat_quest_active'),
-        onYes: {
-            text: "The red ball vibrates with joy from its hiding spot. 'Oh, thank you! You won't regret this!'",
+        id: 'cat_looking_for_ball',
+        petitioner: "A small, anxious-looking cat",
+        text: "Mrow... pardon, your Majesty. I seem to have misplaced my favorite ball. It's red, very bouncy, and answers to the name 'Sir Reginald.' Have you seen it?",
+        isUnique: true,
+        condition: (gs) => gs.flags.has('knows_ball_location'),
+        onYes: { 
+            text: "You point a finger under the throne. The cat's eyes light up, and it immediately pounces toward the spot. You hear a tiny, muffled scream.",
             effects: {},
-            clearFlags: ['cat_quest_active'],
-            onSuccess: (gs) => { gs.flags.set('sided_with_ball', gs.day); }
+            clearFlags: ['knows_ball_location'],
+            onSuccess: (gs) => { gs.flags.set('revealed_ball_location', gs.day); }
         },
-        onNo: {
-            text: "The ball lets out a tiny groan. 'You're a spoilsport. Fine. But don't expect me to come quietly.'",
-            effects: {},
-            clearFlags: ['cat_quest_active'],
-            onSuccess: (gs) => { gs.flags.set('sided_with_cat', gs.day); }
+        onNo: { 
+            text: "You shake your head. The cat's ears droop, and it slinks away sadly to continue its search. You feel a strange sense of relief from under the throne.",
+            effects: { happiness: -1 },
+            clearFlags: ['knows_ball_location'],
+            onSuccess: (gs) => { gs.flags.set('lied_to_cat', gs.day); }
         }
     },
     {
         id: 'cat_quest_cat_reward',
         petitioner: "The happy cat, batting Sir Reginald the ball",
-        text: "I've got him! Thanks to your tip, I found him trying to roll out the main gate. He's a scamp! As thanks, I brought you a gift I found. It's very shiny.",
-        condition: (gs) => gs.flags.has('sided_with_cat') && gs.day >= gs.flags.get('sided_with_cat') + 5,
-        onYes: { 
-            text: "The cat drops a large, glittering diamond at your feet. It must have belonged to a visiting noble.",
-            effects: { treasury: +150, happiness: +5 },
-            clearFlags: ['sided_with_cat']
-        },
-        onNo: {
-            text: "You accept the shiny gift graciously.",
-            effects: { treasury: +150, happiness: +5 },
-            clearFlags: ['sided_with_cat']
-        }
+        text: "I've got him! Thanks to your tip, he's all mine again. He's a scamp! As thanks for your honesty, I brought you a gift I found. It's very shiny.",
+        isNarrativeOnly: true,
+        isUnique: true,
+        condition: (gs) => gs.flags.has('revealed_ball_location') && gs.day >= gs.flags.get('revealed_ball_location') + 3,
+        outcome_text: "The cat drops a large, glittering diamond at your feet. It must have belonged to a visiting noble.",
+        effects: { treasury: +150, happiness: +5 },
+        clearFlags: ['revealed_ball_location']
     },
     {
-        id: 'cat_quest_ball_reward',
+        id: 'ball_quest_ball_reward',
         petitioner: "The Guard Captain, looking puzzled",
         text: "Your Majesty, the oddest thing. We've been finding these exquisite, perfectly preserved mice behind various tapestries. The royal chefs say they're a rare delicacy. A... gift, perhaps?",
-        condition: (gs) => gs.flags.has('sided_with_ball') && gs.day >= gs.flags.get('sided_with_ball') + 5,
-        onYes: {
-            text: "You graciously accept the strange but valuable tribute. The people are pleased with the unexpected bounty for the royal kitchens.",
-            effects: { population: +10, happiness: +10 },
-            clearFlags: ['sided_with_ball']
-        },
-        onNo: {
-            text: "You have the strange gifts prepared for a feast. The people are pleased.",
-            effects: { population: +10, happiness: +10 },
-            clearFlags: ['sided_with_ball']
-        }
+        isNarrativeOnly: true,
+        isUnique: true,
+        condition: (gs) => gs.flags.has('lied_to_cat') && gs.day >= gs.flags.get('lied_to_cat') + 3,
+        outcome_text: "You graciously accept the strange but valuable tribute. The people are pleased with the unexpected bounty for the royal kitchens.",
+        effects: { population: +10, happiness: +10 },
+        clearFlags: ['lied_to_cat']
     },
 
     // --- Advisor Events ---
@@ -236,15 +215,14 @@ const allEvents = [
 
     // --- Other Chained & Standard Events ---
     { id: 'farmer_blight', petitioner: "A Farmer", text: "My liege, a terrible blight has struck our fields! We need 50 gold for new seeds.", onYes: { text: "The farmers are grateful! They promise to remember your generosity.", effects: { treasury: -50, happiness: +15 }, onSuccess: (gs) => { gs.flags.set('helped_farmer_blight', gs.day); } }, onNo: { text: "The farmers despair.", effects: { happiness: -15, population: -10 } } },
-    { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
+    { id: 'farmer_gratitude', petitioner: "The Farmer You Helped", text: "Your Majesty! Thanks to your aid, we had a bountiful harvest. Please, accept this share of our profits as thanks!", isUnique: true, condition: (gs) => gs.flags.has('helped_farmer_blight') && gs.day >= gs.flags.get('helped_farmer_blight') + 15, onYes: { text: "You graciously accept their gift. The people's loyalty deepens.", effects: { treasury: +75, happiness: +10 }, clearFlags: ['helped_farmer_blight'] }, onNo: { text: "You refuse, stating it was your duty. They are touched by your humility.", effects: { happiness: +15 }, clearFlags: ['helped_farmer_blight'] } },
     { id: 'shady_merchant', petitioner: "A Shady Merchant", text: "Psst... a small investment of 20 gold could double your return!", onYes: { text: "The gamble pays off!", effects: { treasury: +20 }, onSuccess: (gs) => { gs.flags.set('trusted_shady_merchant', true); } }, onNo: { text: "You wisely refuse.", effects: { happiness: +5 } } },
-    { id: 'shady_merchant_big_deal', petitioner: "The Shady Merchant", text: "You trusted me once, and it paid off! Now for a *real* opportunity. An overseas venture. It requires 200 gold. Are you in?", condition: (gs) => gs.flags.has('trusted_shady_merchant') && gs.treasury >= 200, onYes: { text: "You hand over the coin pouch... the merchant scurries away.", effects: { treasury: -200 }, clearFlags: ['trusted_shady_merchant'], random_outcomes: [ { chance: 0.5, text: "He returns with a chest of foreign silks! The investment was a massive success!", effects: { treasury: +500 } }, { chance: 0.5, text: "You never see him again. You've been had.", effects: { happiness: -20 } } ] }, onNo: { text: "You decide not to press your luck. The merchant shrugs and disappears.", effects: {}, clearFlags: ['trusted_shady_merchant'] } },
+    { id: 'shady_merchant_big_deal', petitioner: "The Shady Merchant", text: "You trusted me once, and it paid off! Now for a *real* opportunity. An overseas venture. It requires 200 gold. Are you in?", isUnique: true, condition: (gs) => gs.flags.has('trusted_shady_merchant') && gs.treasury >= 200, onYes: { text: "You hand over the coin pouch... the merchant scurries away.", effects: { treasury: -200 }, clearFlags: ['trusted_shady_merchant'], random_outcomes: [ { chance: 0.5, text: "He returns with a chest of foreign silks! The investment was a massive success!", effects: { treasury: +500 } }, { chance: 0.5, text: "You never see him again. You've been had.", effects: { happiness: -20 } } ] }, onNo: { text: "You decide not to press your luck. The merchant shrugs and disappears.", effects: {}, clearFlags: ['trusted_shady_merchant'] } },
     { id: 'alchemist_offer', petitioner: "An Eccentric Alchemist", text: "Behold! My 'Elixir of Fortitude'! For just 40 gold, I can supply it to your guards. Their resolve will be unbreakable!", condition: (gs) => gs.military > 15, onYes: { text: "The alchemist mixes a bubbling green potion for the guards.", effects: { treasury: -40, military: +10, happiness: -5 } }, onNo: { text: "'Your loss!' the alchemist mutters, storming off.", effects: {} } },
     { id: 'inventor_proposal', petitioner: "A Pragmatic Inventor", text: "Your Majesty, I have designed a new type of plow that could revolutionize our farming. I need 100 gold to build the prototypes.", condition: (gs) => gs.population > 120, onYes: { text: "The investment pays off! Food production increases.", effects: { treasury: -100, population: +15 } }, onNo: { text: "The inventor sadly packs up her blueprints and seeks a more forward-thinking patron.", effects: { happiness: -5 } } },
     { id: 'border_dispute', petitioner: "A Stressed Diplomat", text: "A dispute has arisen with a neighboring kingdom over border territories. We can press our claim with military might, or seek a peaceful resolution.", condition: (gs) => gs.day > 50, onYes: { text: "You send a detachment of soldiers to secure the border. The neighbor backs down, for now.", effects: { military: +5, happiness: -5 } }, onNo: { text: "You cede the disputed land to maintain peace. Your neighbor is pleased, but some of your people see it as weakness.", effects: { treasury: +20, happiness: -10 } } },
     { id: 'traveling_circus', petitioner: "A Traveling Circus", text: "For 30 gold, our circus will perform and lift the spirits of your citizens!", onYes: { text: "The circus is a hit!", effects: { treasury: -30, happiness: +25 } }, onNo: { text: "The circus packs up and leaves.", effects: { happiness: -5 } } },
     { 
-        // *** REWORKED EVENT ***
         id: 'goblin_raid', 
         petitioner: "A Scout", 
         text: (gs) => `Goblins are raiding the western farms! Our military strength is only ${gs.military}! We must act!`, 
