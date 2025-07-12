@@ -5,8 +5,9 @@
 // 2. UPDATED: Tax formula to a "high-growth" model based on happiness.
 // 3. UPDATED: Logic to support "isNarrativeOnly" events for storytelling.
 // 4. REMOVED: The happiness cap to allow for infinite scaling.
-// 5. REVERTED: Happiness display is now a number instead of a percentage.
-// 6. ADDED: Emojis to text output for better readability and visual appeal.
+// 5. ADDED: Emojis to text output for better readability and visual appeal.
+// 6. ADDED: Event reminder system for players with a pending decision.
+// 7. BUG FIX: Implemented logic to handle `isUnique` events, preventing repeats in a single day (e.g., Prince's loan collection).
 // --- END CHANGE LOG ---
 
 
@@ -154,7 +155,24 @@ async function destroyKingdom(playerName, reason) {
 async function requestNextChat(playerName) {
     const playerState = await Kingdom.findById(playerName);
     if (!playerState || !playerState.gameActive) return [`${playerName}, you don't have a kingdom. Type !kcreate to start.`];
-    if (playerState.isAwaitingDecision) return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
+    
+    if (playerState.isAwaitingDecision) {
+        const currentEvent = eventsMap.get(playerState.currentEventId);
+        if (!currentEvent) {
+            return [`${playerName}, you need to respond to your current event first! (!yes or !no)`];
+        }
+
+        const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner() : currentEvent.petitioner;
+        const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
+
+        return [
+            `🔔 Just a reminder, ${playerName}... you're still in a conversation.`,
+            `${petitioner} 🗣️ is waiting for your answer.`,
+            `They said: "${eventText}"`,
+            "What is your decision? 🤔 (!yes / !no)"
+        ];
+    }
+
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
 
     const replies = [];
@@ -221,15 +239,19 @@ async function requestNextChat(playerName) {
              playerState.day = 1;
         }
         
+        // --- Generate new events for the day (with unique check) ---
         playerState.eventsForToday = [];
         playerState.currentEventIndex = 0;
         const dailyEventCounts = new Map();
         const numberOfEvents = Math.floor(Math.random() * 3) + 3;
+        const uniqueEventsThisDay = new Set();
 
         for (let i = 0; i < numberOfEvents; i++) {
             const availableEvents = allEvents.filter(e => {
                 const count = dailyEventCounts.get(e.id) || 0;
                 if (count >= 2) return false;
+                if (e.isUnique && uniqueEventsThisDay.has(e.id)) return false;
+
                 const condition = e.condition ? e.condition(playerState) : true;
                 const seasonCondition = e.season ? e.season === playerState.season : true;
                 let advisorCondition = true;
@@ -241,6 +263,9 @@ async function requestNextChat(playerName) {
             const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)];
             playerState.eventsForToday.push(chosenEvent.id);
             dailyEventCounts.set(chosenEvent.id, (dailyEventCounts.get(chosenEvent.id) || 0) + 1);
+            if (chosenEvent.isUnique) {
+                uniqueEventsThisDay.add(chosenEvent.id);
+            }
         }
         
         const princeEventAvailable = playerState.eventsForToday.includes('prince_loan_offer');
