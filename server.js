@@ -11,6 +11,7 @@
 // 3. UPDATED: `requestNextChat` now contains the main logic for starting a new day vs. continuing an existing one.
 // 4. UPDATED: `handleDecision` now increments `currentEventIndex` after a decision is made and guides the user.
 // 5. ADDED: A rule to prevent the same event from appearing more than twice in a single day.
+// 6. ADDED: Logic in daily upkeep to handle persistent effects from flags (e.g., 'gilded_blight_active').
 // --- END CHANGE LOG ---
 
 
@@ -194,7 +195,17 @@ async function requestNextChat(playerName) {
 
             const taxInfo = TAX_LEVELS[playerState.taxRate];
             const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
-            const taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
+            // *** MODIFIED LINE: Changed const to let ***
+            let taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
+            
+            // --- *** NEW BLOCK: Check for persistent flag effects *** ---
+            if (playerState.flags.get('gilded_blight_active')) {
+                taxIncome = Math.floor(taxIncome * 0.75); // 25% penalty to income
+                playerState.military -= 1; // Military readiness slowly decays
+                replies.push("[!] The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
+            }
+            // --- *** END NEW BLOCK *** ---
+
             playerState.treasury += taxIncome;
             if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
 
