@@ -2,16 +2,13 @@
 
 // --- CHANGE LOG ---
 // 1. RESTRUCTURED: The game loop now supports multiple events per day.
-//    - A "day" now consists of 3-5 random events.
-//    - The `!chat` command progresses through the event list for the current day.
-//    - Daily upkeep (taxes, salaries, etc.) is now processed only ONCE at the beginning of a new day of events.
-// 2. ADDED: New fields in KingdomSchema to manage the new loop.
-//    - `eventsForToday`: An array of event IDs for the current day.
-//    - `currentEventIndex`: Tracks progress through the `eventsForToday` array.
-// 3. UPDATED: `requestNextChat` now contains the main logic for starting a new day vs. continuing an existing one.
-// 4. UPDATED: `handleDecision` now increments `currentEventIndex` after a decision is made and guides the user.
-// 5. ADDED: A rule to prevent the same event from appearing more than twice in a single day.
-// 6. ADDED: Logic in daily upkeep to handle persistent effects from flags (e.g., 'gilded_blight_active').
+// 2. ADDED: New fields in KingdomSchema for the multi-event loop.
+// 3. UPDATED: `requestNextChat` to handle the new day/event logic.
+// 4. UPDATED: `handleDecision` to progress through the daily event list.
+// 5. ADDED: Logic for persistent flags (e.g., 'gilded_blight_active').
+// 6. UPDATED: Tax formula to a "high-growth" model based on happiness.
+// 7. ADDED: A hard cap for happiness at 100.
+// 8. UPDATED: All happiness displays to be a percentage (e.g., "50%") for visual clarity.
 // --- END CHANGE LOG ---
 
 
@@ -193,18 +190,19 @@ async function requestNextChat(playerName) {
             const seasonEffect = SEASONS[playerState.season].effects;
             for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
+            // --- *** UPDATED TAX LOGIC: HIGH-GROWTH HAPPINESS MODEL *** ---
             const taxInfo = TAX_LEVELS[playerState.taxRate];
+            const happinessModifier = Math.max(1, (playerState.happiness / 50) + 1);
+            const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop;
+            const incomeAfterHappiness = baseIncome * happinessModifier;
             const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
-            // *** MODIFIED LINE: Changed const to let ***
-            let taxIncome = Math.floor((playerState.population / 10) * taxInfo.income_per_10_pop * treasurerBonus);
-            
-            // --- *** NEW BLOCK: Check for persistent flag effects *** ---
+            let finalIncome = incomeAfterHappiness * treasurerBonus;
             if (playerState.flags.get('gilded_blight_active')) {
-                taxIncome = Math.floor(taxIncome * 0.75); // 25% penalty to income
-                playerState.military -= 1; // Military readiness slowly decays
+                finalIncome = finalIncome * 0.75; 
                 replies.push("[!] The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
             }
-            // --- *** END NEW BLOCK *** ---
+            const taxIncome = Math.floor(finalIncome);
+            // --- *** END OF TAX LOGIC *** ---
 
             playerState.treasury += taxIncome;
             if (taxInfo.happiness_effect !== 0) playerState.happiness += taxInfo.happiness_effect;
@@ -220,6 +218,9 @@ async function requestNextChat(playerName) {
                 }
             }
             playerState.treasury -= totalSalary;
+
+            // --- *** ADDED: Happiness Cap *** ---
+            playerState.happiness = Math.min(100, playerState.happiness);
 
             let upkeepReport = [];
             if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
@@ -357,9 +358,12 @@ async function handleDecision(playerName, choice) {
         chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
     }
 
+    // --- *** ADDED: Happiness Cap *** ---
+    playerState.happiness = Math.min(100, playerState.happiness);
+
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
-    playerState.currentEventIndex++; // *** KEY CHANGE: Move to the next event index ***
+    playerState.currentEventIndex++;
 
     await playerState.save();
 
@@ -377,7 +381,6 @@ async function handleDecision(playerName, choice) {
 
     if (statusChanges.length > 0) replies.push(statusChanges.join(' | '));
     
-    // Add a message indicating what to do next
     if (playerState.currentEventIndex >= playerState.eventsForToday.length) {
         replies.push("The day's business is concluded. Type !chat to start the next day.");
     } else {
@@ -402,6 +405,10 @@ async function handleSetTax(playerName, newRate) {
 
 function formatStatChange(stat, oldValue, newValue) {
     const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '🛡️' };
+    // --- *** UPDATED: Happiness Visual *** ---
+    if (stat === 'happiness') {
+        return `${symbols[stat]} ${oldValue}% ➞ ${newValue}%`;
+    }
     return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
 }
 
@@ -422,9 +429,13 @@ async function showStatus(playerName) {
     }
     return [
         `--- ${playerName}'s Kingdom Status (Day ${playerState.day}) ---`,
-        `💰 Treasury: ${playerState.treasury}`, `😊 Happiness: ${playerState.happiness}`,
-        `👨‍👩‍👧‍👦 Population: ${playerState.population}`, `🛡️ Military: ${playerState.military}`,
-        `⚖️ Tax Rate: ${TAX_LEVELS[playerState.taxRate].label}`, `🌸 Season: ${playerState.season}`,
+        `💰 Treasury: ${playerState.treasury}`, 
+        // --- *** UPDATED: Happiness Visual *** ---
+        `😊 Happiness: ${playerState.happiness}%`,
+        `👨‍👩‍👧‍👦 Population: ${playerState.population}`, 
+        `🛡️ Military: ${playerState.military}`,
+        `⚖️ Tax Rate: ${TAX_LEVELS[playerState.taxRate].label}`, 
+        `🌸 Season: ${playerState.season}`,
         `👑 Council: ${advisorList}`
     ];
 }
