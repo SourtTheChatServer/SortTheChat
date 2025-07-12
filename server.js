@@ -2,11 +2,11 @@
 
 // --- CHANGE LOG ---
 // 1. RESTRUCTURED: The game loop now supports multiple events per day.
-// 2. UPDATED: `requestNextChat` to handle the new day/event logic.
-// 3. UPDATED: Tax formula to a "high-growth" model based on happiness.
-// 4. ADDED: A hard cap for happiness at 100.
-// 5. UPDATED: All happiness displays to be a percentage (e.g., "50%").
-// 6. ADDED: Logic to support "isNarrativeOnly" events that don't require player decisions, allowing for smoother storytelling.
+// 2. UPDATED: Tax formula to a "high-growth" model based on happiness.
+// 3. UPDATED: Logic to support "isNarrativeOnly" events for storytelling.
+// 4. REMOVED: The happiness cap to allow for infinite scaling.
+// 5. REVERTED: Happiness display is now a number instead of a percentage.
+// 6. ADDED: Emojis to text output for better readability and visual appeal.
 // --- END CHANGE LOG ---
 
 
@@ -33,10 +33,8 @@ const KingdomSchema = new mongoose.Schema({
     dayOfSeason: { type: Number, default: 1 },
     advisors: { type: Map, of: Boolean, default: () => new Map() },
     flags: { type: Map, of: mongoose.Schema.Types.Mixed, default: () => new Map() },
-    // NEW FIELDS for multi-event days
     eventsForToday: { type: [String], default: [] },
     currentEventIndex: { type: Number, default: 0 },
-    // ---
     gameActive: { type: Boolean, default: true },
     isAwaitingDecision: { type: Boolean, default: false },
     currentEventId: { type: String, default: null },
@@ -67,7 +65,6 @@ mongoose.connect(MONGO_URI)
 
 // --- 4. CORE GAME LOGIC FUNCTIONS (ASYNC) ---
 
-// Helper function to reset the kingdom state
 function resetKingdomState(playerState) {
     playerState.day = 0;
     playerState.treasury = 100;
@@ -110,7 +107,7 @@ async function createKingdom(playerName) {
 
         return [
             `${playerName}, you already have a kingdom in progress.`,
-            `Are you sure you want to restart? This will ERASE your current game.`,
+            `Are you sure you want to restart? This will ERASE your current game. 💥`,
             `Respond with !y (yes) or !n (no) within 30 seconds.`
         ];
     }
@@ -119,7 +116,7 @@ async function createKingdom(playerName) {
     kingdomToUpdate = resetKingdomState(kingdomToUpdate);
     await kingdomToUpdate.save({ upsert: true });
 
-    return [`${playerName}'s kingdom has been created!`, `Type !chat for your first event.`];
+    return [`Welcome, ruler of ${playerName}! 👑 Your kingdom has been created!`, `Type !chat for your first event.`];
 }
 
 async function handleConfirmation(playerName, choice) {
@@ -136,10 +133,10 @@ async function handleConfirmation(playerName, choice) {
         if (choice === '!y') {
             resetKingdomState(playerState);
             await playerState.save();
-            return [`${playerName}'s kingdom has been reset.`];
+            return [`${playerName}'s kingdom has been reset. A new era begins! 🌅`];
         } else {
             await playerState.save();
-            return [`${playerName}, restart cancelled. Your kingdom is safe.`];
+            return [`${playerName}, restart cancelled. Your kingdom is safe. ✅`];
         }
     }
     await playerState.save();
@@ -151,7 +148,7 @@ async function destroyKingdom(playerName, reason) {
     if (!kingdom || !kingdom.gameActive) return [];
     kingdom.gameActive = false;
     await kingdom.save();
-    return [`--- ${playerName}'s reign has ended after ${kingdom.day} days. ---`, `Reason: ${reason}`];
+    return [`--- ${playerName}'s reign has ended after ${kingdom.day} days. ☠️ ---`, `Reason: ${reason}`];
 }
 
 async function requestNextChat(playerName) {
@@ -165,7 +162,6 @@ async function requestNextChat(playerName) {
     const isNewDay = playerState.currentEventIndex >= playerState.eventsForToday.length;
 
     if (isNewDay) {
-        // --- START OF DAY LOGIC ---
         const isFirstTurnOfGame = playerState.day === 0 && playerState.eventsForToday.length === 0;
 
         if (!isFirstTurnOfGame) {
@@ -179,12 +175,11 @@ async function requestNextChat(playerName) {
                 playerState.dayOfSeason = 1;
                 const seasonNames = Object.keys(SEASONS);
                 playerState.season = seasonNames[(seasonNames.indexOf(playerState.season) + 1) % seasonNames.length];
-                replies.push(`A new season has begun in ${playerName}'s kingdom: ${playerState.season}!`);
+                replies.push(`A new season has begun in ${playerName}'s kingdom: ${SEASONS[playerState.season].icon} ${playerState.season}!`);
             }
             const seasonEffect = SEASONS[playerState.season].effects;
             for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
-            // --- TAX LOGIC: HIGH-GROWTH HAPPINESS MODEL ---
             const taxInfo = TAX_LEVELS[playerState.taxRate];
             const happinessModifier = Math.max(1, (playerState.happiness / 50) + 1);
             const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop;
@@ -193,7 +188,7 @@ async function requestNextChat(playerName) {
             let finalIncome = incomeAfterHappiness * treasurerBonus;
             if (playerState.flags.get('gilded_blight_active')) {
                 finalIncome = finalIncome * 0.75; 
-                replies.push("[!] The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
+                replies.push("❗️ The Gilded Blight's placid calm saps your kingdom's productivity and vigilance.");
             }
             const taxIncome = Math.floor(finalIncome);
             playerState.treasury += taxIncome;
@@ -211,24 +206,21 @@ async function requestNextChat(playerName) {
             }
             playerState.treasury -= totalSalary;
 
-            playerState.happiness = Math.min(100, playerState.happiness);
-
             let upkeepReport = [];
             if (playerState.happiness !== oldStats.happiness) upkeepReport.push(formatStatChange('happiness', oldStats.happiness, playerState.happiness));
             if (playerState.population !== oldStats.population) upkeepReport.push(formatStatChange('population', oldStats.population, playerState.population));
             if (playerState.treasury !== oldStats.treasury) upkeepReport.push(formatStatChange('treasury', oldStats.treasury, playerState.treasury));
             if (playerState.military !== oldStats.military) upkeepReport.push(formatStatChange('military', oldStats.military, playerState.military));
-            if (upkeepReport.length > 0) replies.push(`Daily changes for ${playerName}: ${upkeepReport.join(' | ')}`);
+            if (upkeepReport.length > 0) replies.push(`📈 Daily changes for ${playerName}: ${upkeepReport.join(' | ')}`);
 
             if (playerState.happiness <= REVOLT_HAPPINESS_THRESHOLD && playerState.taxRate !== 'low') {
-                replies.push(`[!] WARNING: Happiness in ${playerName}'s kingdom is critically low!`);
+                replies.push(`🚨 WARNING: Happiness in ${playerName}'s kingdom is critically low!`);
                 playerState.happiness -= 2;
             }
         } else {
              playerState.day = 1;
         }
         
-        // --- Generate new events for the day ---
         playerState.eventsForToday = [];
         playerState.currentEventIndex = 0;
         const dailyEventCounts = new Map();
@@ -238,7 +230,6 @@ async function requestNextChat(playerName) {
             const availableEvents = allEvents.filter(e => {
                 const count = dailyEventCounts.get(e.id) || 0;
                 if (count >= 2) return false;
-
                 const condition = e.condition ? e.condition(playerState) : true;
                 const seasonCondition = e.season ? e.season === playerState.season : true;
                 let advisorCondition = true;
@@ -246,9 +237,7 @@ async function requestNextChat(playerName) {
                 else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor);
                 return condition && seasonCondition && advisorCondition;
             });
-
             if (availableEvents.length === 0) break;
-
             const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)];
             playerState.eventsForToday.push(chosenEvent.id);
             dailyEventCounts.set(chosenEvent.id, (dailyEventCounts.get(chosenEvent.id) || 0) + 1);
@@ -264,14 +253,13 @@ async function requestNextChat(playerName) {
 
         if (playerState.eventsForToday.length === 0) {
             replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} ---`);
-            replies.push("The kingdom is quiet today. No new petitions have arrived.");
+            replies.push("The kingdom is quiet today. 😌 No new petitions have arrived.");
             replies.push("Type !chat to start the next day.");
             await playerState.save();
             return replies;
         }
     }
 
-    // --- PRESENT THE CURRENT EVENT ---
     const eventId = playerState.eventsForToday[playerState.currentEventIndex];
     const currentEvent = eventsMap.get(eventId);
 
@@ -289,26 +277,22 @@ async function requestNextChat(playerName) {
     const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
 
     replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} (Event ${playerState.currentEventIndex + 1}/${playerState.eventsForToday.length}) ---`);
-    replies.push(`${petitioner} wants to talk.`);
+    replies.push(`${petitioner} 🗣️ wants to talk.`);
     replies.push(`"${eventText}"`);
     
-    // --- *** NEW: Narrative Event Handling *** ---
     if (currentEvent.isNarrativeOnly) {
-        playerState.isAwaitingDecision = false; // Not waiting for a !yes/!no
-        // Combine presentation replies with resolution replies in one go
+        playerState.isAwaitingDecision = false;
         const resolutionReplies = await handleDecision(playerName, '!narrative');
         return replies.concat(resolutionReplies);
     }
-    // --- *** END NEW BLOCK *** ---
 
-    replies.push("What do you say? (!yes / !no)");
+    replies.push("What do you say? 🤔 (!yes / !no)");
 
     return replies;
 }
 
 async function handleDecision(playerName, choice) {
     const playerState = await Kingdom.findById(playerName);
-    // Modified check to allow internal '!narrative' call
     if (!playerState || !playerState.gameActive || (playerState.isAwaitingDecision === false && choice !== '!narrative')) return [];
     if (playerState.pendingAction) return [`${playerName}, you must first respond to your pending confirmation (!y or !n).`];
     const currentEvent = eventsMap.get(playerState.currentEventId);
@@ -322,24 +306,18 @@ async function handleDecision(playerName, choice) {
     const oldStats = { ...playerState.toObject() };
     const replies = [];
 
-    // --- *** NEW: Logic for handling different event types *** ---
     let chosenOutcome;
     if (choice === '!narrative' && currentEvent.isNarrativeOnly) {
-        chosenOutcome = currentEvent; // For narrative events, the "outcome" is the event itself.
-        replies.push(`${playerName}, ${currentEvent.outcome_text}`);
+        chosenOutcome = currentEvent;
+        replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`);
     } else {
         const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
         chosenOutcome = currentEvent[decisionKey];
-        if (!chosenOutcome) {
-            return ["That is not a valid choice for this event."];
-        }
-        replies.push(`${playerName}, ${chosenOutcome.text}`);
+        if (!chosenOutcome) { return ["That is not a valid choice for this event."]; }
+        replies.push(`💬 ${playerName}, ${chosenOutcome.text}`);
     }
-    // --- *** END NEW BLOCK *** ---
 
-    if (chosenOutcome.triggersGameOver) {
-        return destroyKingdom(playerName, chosenOutcome.text);
-    }
+    if (chosenOutcome.triggersGameOver) { return destroyKingdom(playerName, chosenOutcome.text); }
 
     if (chosenOutcome.random_outcomes) {
         const roll = Math.random();
@@ -347,7 +325,7 @@ async function handleDecision(playerName, choice) {
         for (const outcome of chosenOutcome.random_outcomes) {
             cumulativeChance += outcome.chance;
             if (roll < cumulativeChance) {
-                replies.push(outcome.text);
+                replies.push(`🎲 ${outcome.text}`);
                 if (outcome.effects) {
                     for (const stat in outcome.effects) {
                         if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat];
@@ -369,8 +347,6 @@ async function handleDecision(playerName, choice) {
         chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag));
     }
 
-    playerState.happiness = Math.min(100, playerState.happiness);
-
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
     playerState.currentEventIndex++;
@@ -382,19 +358,17 @@ async function handleDecision(playerName, choice) {
     if (chosenOutcome.random_outcomes) {
         chosenOutcome.random_outcomes.forEach(o => Object.keys(o.effects || {}).forEach(k => allEffectKeys.add(k)));
     }
-
     for (const stat of allEffectKeys) {
         if (oldStats.hasOwnProperty(stat) && oldStats[stat] !== playerState[stat]) {
             statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
         }
     }
-
-    if (statusChanges.length > 0) replies.push(statusChanges.join(' | '));
+    if (statusChanges.length > 0) replies.push(`📊 Stat Changes: ${statusChanges.join(' | ')}`);
     
     if (playerState.currentEventIndex >= playerState.eventsForToday.length) {
-        replies.push("The day's business is concluded. Type !chat to start the next day.");
+        replies.push("The day's business is concluded. ✅ Type !chat to start the next day.");
     } else {
-        replies.push("Type !chat for your next petitioner.");
+        replies.push("A new petitioner approaches. 👉 Type !chat for your next event.");
     }
     
     return replies;
@@ -410,14 +384,11 @@ async function handleSetTax(playerName, newRate) {
     playerState.taxRate = newRate;
     playerState.taxChangeCooldown = 3;
     await playerState.save();
-    return [`${playerName}, your kingdom's tax rate is now ${TAX_LEVELS[newRate].label}.`];
+    return [`✅ Your kingdom's tax rate is now set to ${TAX_LEVELS[newRate].label}.`];
 }
 
 function formatStatChange(stat, oldValue, newValue) {
-    const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '🛡️' };
-    if (stat === 'happiness') {
-        return `${symbols[stat]} ${oldValue}% ➞ ${newValue}%`;
-    }
+    const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '💂' };
     return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
 }
 
@@ -439,9 +410,9 @@ async function showStatus(playerName) {
     return [
         `--- ${playerName}'s Kingdom Status (Day ${playerState.day}) ---`,
         `💰 Treasury: ${playerState.treasury}`, 
-        `😊 Happiness: ${playerState.happiness}%`,
+        `😊 Happiness: ${playerState.happiness}`,
         `👨‍👩‍👧‍👦 Population: ${playerState.population}`, 
-        `🛡️ Military: ${playerState.military}`,
+        `💂 Military: ${playerState.military}`,
         `⚖️ Tax Rate: ${TAX_LEVELS[playerState.taxRate].label}`, 
         `🌸 Season: ${playerState.season}`,
         `👑 Council: ${advisorList}`
@@ -451,13 +422,13 @@ async function showStatus(playerName) {
 function showHelp() {
     return [
         "--- Kingdom Chat Help ---",
-        "!kcreate: Create/restart your personal kingdom.",
-        "!chat: Talk to the next person waiting. This progresses the day.",
-        "!yes / !no: Respond to the person you're talking to.",
-        "!y / !n: Respond to a confirmation prompt.",
-        "!status: Shows the full status of your kingdom.",
-        "!settax [low|normal|high]: Sets your tax rate.",
-        "!kdestroy: Abdicate the throne and end your game."
+        "🏰 `!kcreate`: Create or restart your personal kingdom.",
+        "💬 `!chat`: Talk to the next person waiting. This progresses the day.",
+        "👍 `!yes` / 👎 `!no`: Respond to the person you're talking to.",
+        "✅ `!y` / ❌ `!n`: Respond to a confirmation prompt (like restarting).",
+        "📊 `!status`: Shows the full status of your kingdom.",
+        "⚖️ `!settax [low|normal|high]`: Sets your tax rate.",
+        "💥 `!kdestroy`: Abdicate the throne and end your game."
     ];
 }
 
