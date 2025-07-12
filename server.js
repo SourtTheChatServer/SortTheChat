@@ -313,7 +313,7 @@ async function handleDecision(playerName, choice) {
     }
     
     if (customOutcomeText) {
-        replies.push(`⚖️ ${customOutcomeText}`);
+      replies.push(`🗣️ ${customOutcomeText}`);
     }
 
     if (chosenOutcome.clearFlags) { chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag)); }
