@@ -6,7 +6,14 @@
 //    - A new flag, 'prince_is_enemy', is now used.
 //    - Repaying the loan peacefully allows the prince to offer help again in the future.
 //    - Refusing to repay and fighting the prince sets the 'prince_is_enemy' flag, permanently cutting off future aid from him.
-// 2. All other content remains the same.
+// 2. UPDATED: "goblin_raid" event.
+//    - The 'onYes' (fight) option is now a gamble with multiple outcomes.
+//    - There is a 25% chance for a decisive victory that awards bonus treasure (gold or military armor).
+//    - There is a chance for a standard victory or an outright defeat.
+// 3. UPDATED: "kid_adventure_return" event.
+//    - The 'onNo' path now has a slightly different outcome to better reflect player choice.
+// 4. ADDED: New high-risk events ("The Living Chest", "The Gilded Blight").
+// 5. ADDED: New narrative event chain ("The Cat, the Ball, and the Ruler").
 // --- END CHANGE LOG ---
 
 
@@ -46,7 +53,6 @@ const allEvents = [
         onNo: { text: "She shuffles away sadly. It was only a few coins.", effects: {} }
     },
     {
-        // *** MODIFIED EVENT ***
         id: 'prince_loan_offer',
         petitioner: "The Smug Prince of Almorg",
         text: "Your Majesty. I couldn't help but notice your... empty-looking treasury. I would be *delighted* to offer you a loan of 500 gold. I'll return for it in 10 days, of course.",
@@ -59,17 +65,16 @@ const allEvents = [
         onNo: { text: "You refuse his charity. With no funds and no prospects, your kingdom collapses into chaos.", triggersGameOver: true }
     },
     {
-        // *** MODIFIED EVENT ***
         id: 'prince_loan_collection',
         petitioner: "The Smug Prince of Almorg",
         text: "I've returned as promised for my 500 gold. I trust it's ready?",
         condition: (gs) => gs.flags.has('loan_from_prince') && gs.day >= gs.flags.get('loan_from_prince') + 10,
-        onYes: { // This is the "peaceful repayment" option
+        onYes: {
             text: "He counts the coins and nods. 'Until next time.' The debt is settled.",
             effects: { treasury: -500 },
             clearFlags: ['loan_from_prince']
         },
-        onNo: { // This is the "fight" option
+        onNo: {
             text: "You refuse to pay. This is an act of war! His army marches on your kingdom.",
             clearFlags: ['loan_from_prince'],
             onSuccess: (gs) => { gs.flags.set('prince_is_enemy', true); },
@@ -95,6 +100,7 @@ const allEvents = [
         onNo: { text: "The kid's face falls. He kicks a rock and trudges away.", effects: { happiness: -10 } }
     },
     {
+        // *** MODIFIED EVENT ***
         id: 'kid_adventure_return',
         petitioner: "The Guard Captain",
         text: "He's back! The kid has returned from his adventure, looking muddy but triumphant. Shall we see what he found?",
@@ -111,15 +117,113 @@ const allEvents = [
             ]
         },
         onNo: {
-            text: "You greet the returning adventurer.",
-            effects: { military: +10 },
+            text: "You offer a perfunctory greeting before inspecting the haul. The kid looks a little disappointed by your lack of enthusiasm.",
+            effects: { military: +10, happiness: -2 }, // Note: Differentiated effects
             clearFlags: ['kid_on_adventure'],
             random_outcomes: [
-                { chance: 0.05, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
-                { chance: 0.25, text: "He stumbled upon a goblin treasure hoard!", effects: { treasury: +200 } },
-                { chance: 0.50, text: "He found a lost merchant's purse on the road.", effects: { treasury: +50 } },
+                { chance: 0.03, text: "He found a dragon's nest and snagged a giant gem while it slept!", effects: { treasury: +500 } },
+                { chance: 0.22, text: "He stumbled upon a goblin treasure hoard!", effects: { treasury: +200 } },
+                { chance: 0.55, text: "He found a lost merchant's purse on the road.", effects: { treasury: +50 } },
                 { chance: 0.20, text: "He proudly presents you with a... weirdly shaped rock.", effects: { treasury: +1 } }
             ]
+        }
+    },
+
+    // --- NEW: High-Risk, Tempting Events ---
+    {
+        id: 'living_chest_offer',
+        petitioner: "A Grotesque, Living Chest",
+        text: "It creaks open its single, bloodshot eye. A telepathic voice echoes in your mind: 'I hunger. You have... spare souls. I have... strength. Feed me 20 of your people, and I will grant your army impenetrable armor.'",
+        condition: (gs) => gs.military < 40 && gs.population > 50,
+        onYes: {
+            text: "The chest's lid flies open with a horrifying shriek. A chilling wind sweeps through the throne room. You feel a great, silent loss across the kingdom, but your barracks captain reports the armor of your soldiers now glows with a faint, unholy light.",
+            effects: { military: +35, population: -20, happiness: -25 }
+        },
+        onNo: {
+            text: "You banish the abhorrent creature. It slams its eye shut and vanishes, leaving only the faint smell of ozone. Your people are relieved by your righteous choice.",
+            effects: { happiness: +5 }
+        }
+    },
+    {
+        id: 'gilded_blight_offer',
+        petitioner: "A smiling man in a golden mask",
+        text: "Your people are so... morose. Unhappiness is a disease. I have the cure. For 150 gold, I can release a 'Golden Pollen' into the air. It will make everyone blissfully content. They will worry about nothing... not even work, or danger, or ambition.",
+        condition: (gs) => gs.happiness < 30,
+        onYes: {
+            text: "You agree. The man bows, and soon a shimmering golden dust settles over the kingdom. The incessant complaining stops. A placid calm descends upon your people.",
+            effects: { treasury: -150, happiness: +50 },
+            // NOTE: For this flag to have a mechanical effect, a check must be added to the daily upkeep logic in server.js
+            onSuccess: (gs) => { gs.flags.set('gilded_blight_active', true); } 
+        },
+        onNo: {
+            text: "You refuse to resort to such measures. The man's smile tightens, and he fades from view. Your problems remain, but so does your people's free will.",
+            effects: { happiness: +5 }
+        }
+    },
+
+    // --- NEW: Narrative Event Chain (Cat Quest) ---
+    {
+        id: 'cat_quest_start',
+        petitioner: "A small, anxious-looking cat",
+        text: "Mrow... pardon, your Majesty. I seem to have misplaced my favorite ball. It's red, very bouncy, and answers to the name 'Sir Reginald.' Have you seen it?",
+        onYes: {
+            text: "The cat gives you a grateful slow-blink. 'Thank you, tall one. I will search the gardens again.'",
+            effects: {},
+            onSuccess: (gs) => { gs.flags.set('cat_quest_active', true); }
+        },
+        onNo: {
+            text: "The cat's ears droop. It lets out a sad little 'mew' and slinks away.",
+            effects: { happiness: -1 }
+        }
+    },
+    {
+        id: 'cat_quest_ball_encounter',
+        petitioner: "A muffled voice from under your throne",
+        text: "Psst! You! The ruler! That cat sent you, didn't she? Don't tell her where I am! She's a tyrant! She bats me under armoires and dunks me in water bowls! I'm finally free! Please, lie to her!",
+        condition: (gs) => gs.flags.has('cat_quest_active'),
+        onYes: {
+            text: "The red ball vibrates with joy from its hiding spot. 'Oh, thank you! You won't regret this!'",
+            effects: {},
+            clearFlags: ['cat_quest_active'],
+            onSuccess: (gs) => { gs.flags.set('sided_with_ball', gs.day); }
+        },
+        onNo: {
+            text: "The ball lets out a tiny groan. 'You're a spoilsport. Fine. But don't expect me to come quietly.'",
+            effects: {},
+            clearFlags: ['cat_quest_active'],
+            onSuccess: (gs) => { gs.flags.set('sided_with_cat', gs.day); }
+        }
+    },
+    {
+        id: 'cat_quest_cat_reward',
+        petitioner: "The happy cat, batting Sir Reginald the ball",
+        text: "I've got him! Thanks to your tip, I found him trying to roll out the main gate. He's a scamp! As thanks, I brought you a gift I found. It's very shiny.",
+        condition: (gs) => gs.flags.has('sided_with_cat') && gs.day >= gs.flags.get('sided_with_cat') + 5,
+        onYes: { 
+            text: "The cat drops a large, glittering diamond at your feet. It must have belonged to a visiting noble.",
+            effects: { treasury: +150, happiness: +5 },
+            clearFlags: ['sided_with_cat']
+        },
+        onNo: {
+            text: "You accept the shiny gift graciously.",
+            effects: { treasury: +150, happiness: +5 },
+            clearFlags: ['sided_with_cat']
+        }
+    },
+    {
+        id: 'cat_quest_ball_reward',
+        petitioner: "The Guard Captain, looking puzzled",
+        text: "Your Majesty, the oddest thing. We've been finding these exquisite, perfectly preserved mice behind various tapestries. The royal chefs say they're a rare delicacy. A... gift, perhaps?",
+        condition: (gs) => gs.flags.has('sided_with_ball') && gs.day >= gs.flags.get('sided_with_ball') + 5,
+        onYes: {
+            text: "You graciously accept the strange but valuable tribute. The people are pleased with the unexpected bounty for the royal kitchens.",
+            effects: { population: +10, happiness: +10 },
+            clearFlags: ['sided_with_ball']
+        },
+        onNo: {
+            text: "You have the strange gifts prepared for a feast. The people are pleased.",
+            effects: { population: +10, happiness: +10 },
+            clearFlags: ['sided_with_ball']
         }
     },
 
@@ -139,7 +243,23 @@ const allEvents = [
     { id: 'inventor_proposal', petitioner: "A Pragmatic Inventor", text: "Your Majesty, I have designed a new type of plow that could revolutionize our farming. I need 100 gold to build the prototypes.", condition: (gs) => gs.population > 120, onYes: { text: "The investment pays off! Food production increases.", effects: { treasury: -100, population: +15 } }, onNo: { text: "The inventor sadly packs up her blueprints and seeks a more forward-thinking patron.", effects: { happiness: -5 } } },
     { id: 'border_dispute', petitioner: "A Stressed Diplomat", text: "A dispute has arisen with a neighboring kingdom over border territories. We can press our claim with military might, or seek a peaceful resolution.", condition: (gs) => gs.day > 50, onYes: { text: "You send a detachment of soldiers to secure the border. The neighbor backs down, for now.", effects: { military: +5, happiness: -5 } }, onNo: { text: "You cede the disputed land to maintain peace. Your neighbor is pleased, but some of your people see it as weakness.", effects: { treasury: +20, happiness: -10 } } },
     { id: 'traveling_circus', petitioner: "A Traveling Circus", text: "For 30 gold, our circus will perform and lift the spirits of your citizens!", onYes: { text: "The circus is a hit!", effects: { treasury: -30, happiness: +25 } }, onNo: { text: "The circus packs up and leaves.", effects: { happiness: -5 } } },
-    { id: 'goblin_raid', petitioner: "A Scout", text: (gs) => `Goblins are raiding the western farms! Our military strength is only ${gs.military}!`, condition: (gs) => gs.military < 30, onYes: { text: "The guards repel the goblins, but take some losses.", effects: { military: -5, happiness: +10, treasury: -10 } }, onNo: { text: "The goblins raid several farms before retreating.", effects: { happiness: -15, population: -10, treasury: -20 } } },
+    { 
+        // *** REWORKED EVENT ***
+        id: 'goblin_raid', 
+        petitioner: "A Scout", 
+        text: (gs) => `Goblins are raiding the western farms! Our military strength is only ${gs.military}! We must act!`, 
+        condition: (gs) => gs.military < 30, 
+        onYes: { 
+            text: "You order your troops to engage the goblin raiding party!",
+            random_outcomes: [
+                { chance: 0.10, text: "A stunning victory! Your troops crushed the goblins and found their treasure stash!", effects: { treasury: +75, happiness: +15 } },
+                { chance: 0.15, text: "A stunning victory! Your troops routed the goblins and recovered a cache of surprisingly well-made goblin armor.", effects: { military: +10, happiness: +15 } },
+                { chance: 0.50, text: "You repel the goblins, but not without cost. The western farms are safe, for now.", effects: { military: -5, happiness: +10, treasury: -10 } },
+                { chance: 0.25, text: "The goblins were more numerous than expected! They broke your lines and pillaged freely before retreating.", effects: { military: -10, happiness: -15, population: -5 } }
+            ]
+        }, 
+        onNo: { text: "You decide not to risk an engagement. The goblins raid several farms before retreating.", effects: { happiness: -15, population: -10, treasury: -20 } } 
+    },
     { id: 'migrant_group', petitioner: "The Guard Captain", text: "A group of 20 migrants has arrived at the gates, seeking refuge.", onYes: { text: "You welcome them. They are hardworking and grateful.", effects: { population: +20, happiness: +5 } }, onNo: { text: "You turn the migrants away.", effects: { happiness: -10 } } },
 
     // --- Seasonal Events ---
