@@ -1,11 +1,4 @@
-// server.js
-
-// --- CHANGE LOG ---
-// 1. BUG FIX: Corrected a `ReferenceError` in `handleDecision` where `outcome` was used instead of `chosenOutcome`. This was the cause of the crash.
-// 2. IMPROVED: The stat change reporting in `handleDecision` is now more robust and correctly reports changes to all stats, including those modified by complex `onSuccess` functions.
-// 3. All previous features (Crime system, unique events, emojis, etc.) are preserved and stable.
-// --- END CHANGE LOG ---
-
+// server.js (Completed)
 
 // --- 1. SETUP & IMPORTS ---
 const express = require('express');
@@ -153,7 +146,7 @@ async function requestNextChat(playerName) {
             await playerState.save();
             return [`An error occurred with your last event. Please type !chat to continue.`];
         }
-        const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner() : currentEvent.petitioner;
+        const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner(playerState) : currentEvent.petitioner;
         const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
         return [
             `🔔 Just a reminder, ${playerName}... you're still in a conversation.`,
@@ -187,11 +180,13 @@ async function requestNextChat(playerName) {
             for (const stat in seasonEffect) playerState[stat] += seasonEffect[stat];
 
             const taxInfo = TAX_LEVELS[playerState.taxRate];
-            const happinessModifier = Math.max(1, (playerState.happiness / 50) + 1);
+            // ***CHANGE***: Replaced overpowered happiness modifier with a more balanced one.
+            const happinessModifier = 1 + ((playerState.happiness - 50) / 100); 
             const baseIncome = (playerState.population / 10) * taxInfo.income_per_10_pop;
-            const incomeAfterHappiness = baseIncome * happinessModifier;
+            const incomeAfterHappiness = baseIncome * Math.max(0.25, happinessModifier); // Ensure modifier doesn't go below 0.25x
             const treasurerBonus = playerState.advisors.get('treasurer') ? 1.10 : 1.0;
             let finalIncome = incomeAfterHappiness * treasurerBonus;
+            
             if (playerState.flags.get('active_crime_gang')) {
                 const dailyTheft = playerState.flags.get('active_crime_gang') === 'entrenched' ? 40 : 20;
                 finalIncome -= dailyTheft;
@@ -246,28 +241,76 @@ async function requestNextChat(playerName) {
         } else {
              playerState.day = 1;
         }
-        
+
+        // --- ***CHANGE***: Savior Event & Game Over Override Logic ---
+        let hasOverriddenEvent = false;
         playerState.eventsForToday = [];
         playerState.currentEventIndex = 0;
-        const dailyEventCounts = new Map();
-        const numberOfEvents = Math.floor(Math.random() * 3) + 3;
-        const uniqueEventsThisDay = new Set();
-        for (let i = 0; i < numberOfEvents; i++) { const availableEvents = allEvents.filter(e => { const count = dailyEventCounts.get(e.id) || 0; if (count >= 2) return false; if (e.isUnique && uniqueEventsThisDay.has(e.id)) return false; const condition = e.condition ? e.condition(playerState) : true; const seasonCondition = e.season ? e.season === playerState.season : true; let advisorCondition = true; if (e.advisor) advisorCondition = playerState.advisors.get(e.advisor); else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor); return condition && seasonCondition && advisorCondition; }); if (availableEvents.length === 0) break; const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)]; playerState.eventsForToday.push(chosenEvent.id); dailyEventCounts.set(chosenEvent.id, (dailyEventCounts.get(chosenEvent.id) || 0) + 1); if (chosenEvent.isUnique) { uniqueEventsThisDay.add(chosenEvent.id); } }
+
+        // CHECK FOR BANKRUPTCY
+        if (playerState.treasury < 0) {
+            const loanEvent = eventsMap.get('prince_loan_offer');
+            const canOfferLoan = loanEvent && (!loanEvent.condition || loanEvent.condition(playerState));
+            if (canOfferLoan) {
+                replies.push(`🚨 Your Majesty, the treasury is empty! A smug-looking prince has arrived with a timely, if suspicious, offer...`);
+                playerState.eventsForToday = ['prince_loan_offer'];
+                hasOverriddenEvent = true;
+            } else {
+                return destroyKingdom(playerName, "The kingdom is bankrupt and there are no prospects for a loan!");
+            }
+        }
+        // CHECK FOR REVOLT (only if not already bankrupt)
+        if (!hasOverriddenEvent && playerState.happiness <= 0) {
+            const circusEvent = eventsMap.get('traveling_circus');
+            const canHostCircus = circusEvent && playerState.treasury >= 30; // Cost of the circus event
+            if (canHostCircus) {
+                replies.push(`🚨 The people are on the brink of revolt! A traveling circus has arrived, offering a chance to lift their spirits... for a price.`);
+                playerState.eventsForToday = ['traveling_circus'];
+                hasOverriddenEvent = true;
+            } else {
+                return destroyKingdom(playerName, "The people have revolted! With no money to appease them, the castle gates have been breached.");
+            }
+        }
+
+        // Only run normal event selection if a savior event wasn't forced
+        if (!hasOverriddenEvent) {
+            const dailyEventCounts = new Map();
+            const numberOfEvents = Math.floor(Math.random() * 3) + 3;
+            for (let i = 0; i < numberOfEvents; i++) { 
+                const availableEvents = allEvents.filter(e => { 
+                    const count = dailyEventCounts.get(e.id) || 0; 
+                    // ***CHANGE***: Max same event per day is now 1.
+                    if (count >= 1) return false; 
+                    if (e.isUnique && playerState.flags.has(e.id)) return false; // Check permanent flag for unique events
+                    const condition = e.condition ? e.condition(playerState) : true; 
+                    const seasonCondition = e.season ? e.season === playerState.season : true; 
+                    let advisorCondition = true; 
+                    if (e.advisor) advisorCondition = playerState.advisors.get(e.advisor); 
+                    else if (e.requiresNoAdvisor) advisorCondition = !playerState.advisors.get(e.requiresNoAdvisor); 
+                    return condition && seasonCondition && advisorCondition; 
+                }); 
+                if (availableEvents.length === 0) break; 
+                const chosenEvent = availableEvents[Math.floor(Math.random() * availableEvents.length)]; 
+                playerState.eventsForToday.push(chosenEvent.id); 
+                dailyEventCounts.set(chosenEvent.id, 1);
+            }
+        }
         
-        const princeEventAvailable = playerState.eventsForToday.includes('prince_loan_offer');
-        if (playerState.treasury < 0 && !princeEventAvailable) { return destroyKingdom(playerName, "The kingdom is bankrupt!"); }
-        if (playerState.happiness <= 0) { return destroyKingdom(playerName, "The people have revolted!"); }
         if (playerState.eventsForToday.length === 0) { replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} ---`); replies.push("The kingdom is quiet today. 😌 No new petitions have arrived."); replies.push("Type !chat to start the next day."); await playerState.save(); return replies; }
     }
 
     const eventId = playerState.eventsForToday[playerState.currentEventIndex];
     const currentEvent = eventsMap.get(eventId);
     if (!currentEvent) { playerState.currentEventIndex++; await playerState.save(); return requestNextChat(playerName); }
+    
     playerState.currentEventId = currentEvent.id;
     playerState.isAwaitingDecision = true;
-    await playerState.save();
-    const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner() : currentEvent.petitioner;
+    
+    const petitioner = typeof currentEvent.petitioner === 'function' ? currentEvent.petitioner(playerState) : currentEvent.petitioner;
     const eventText = typeof currentEvent.text === 'function' ? currentEvent.text(playerState) : currentEvent.text;
+    
+    await playerState.save();
+
     replies.push(`--- ${playerName}'s Kingdom, Day ${playerState.day} (Event ${playerState.currentEventIndex + 1}/${playerState.eventsForToday.length}) ---`);
     replies.push(`${petitioner} 🗣️ wants to talk.`);
     replies.push(`"${eventText}"`);
@@ -287,10 +330,27 @@ async function handleDecision(playerName, choice) {
     const replies = [];
     let chosenOutcome;
     let customOutcomeText = null;
+    let eventResolution = null;
 
     if (choice === '!narrative' && currentEvent.isNarrativeOnly) {
-        chosenOutcome = currentEvent;
-        replies.push(`📜 ${playerName}, ${currentEvent.outcome_text}`);
+        eventResolution = currentEvent;
+        // Narrative-only events can still have random outcomes
+        if (eventResolution.random_outcomes) {
+            const roll = Math.random();
+            let cumulativeChance = 0;
+            for (const outcome of eventResolution.random_outcomes) {
+                cumulativeChance += outcome.chance;
+                if (roll < cumulativeChance) {
+                    chosenOutcome = outcome;
+                    break;
+                }
+            }
+        }
+         // If no random outcome was chosen or existed, the event itself is the outcome
+        if (!chosenOutcome) {
+            chosenOutcome = eventResolution;
+        }
+        replies.push(`📜 ${playerName}, ${chosenOutcome.outcome_text || chosenOutcome.text || ''}`);
     } else {
         const decisionKey = (choice === '!yes') ? 'onYes' : 'onNo';
         chosenOutcome = currentEvent[decisionKey];
@@ -298,10 +358,24 @@ async function handleDecision(playerName, choice) {
         replies.push(`💬 ${playerName}, ${chosenOutcome.text}`);
     }
 
-    if (chosenOutcome.triggersGameOver) { return destroyKingdom(playerName, chosenOutcome.text); }
+    if (chosenOutcome.triggersGameOver) { 
+        const gameOverReplies = await destroyKingdom(playerName, chosenOutcome.text);
+        return replies.concat(gameOverReplies);
+    }
     
-    // --- *** BUG FIX: Renamed all instances of `outcome` to `chosenOutcome` below *** ---
-    if (chosenOutcome.random_outcomes) { const roll = Math.random(); let cumulativeChance = 0; for (const outcome of chosenOutcome.random_outcomes) { cumulativeChance += outcome.chance; if (roll < cumulativeChance) { replies.push(`🎲 ${outcome.text}`); if (outcome.effects) { for (const stat in outcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat]; } } break; } } }
+    if (chosenOutcome.random_outcomes) { 
+        const roll = Math.random(); 
+        let cumulativeChance = 0; 
+        for (const outcome of chosenOutcome.random_outcomes) { 
+            cumulativeChance += outcome.chance; 
+            if (roll < cumulativeChance) { 
+                replies.push(`🎲 ${outcome.text}`); 
+                if (outcome.effects) { for (const stat in outcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += outcome.effects[stat]; } }
+                if (outcome.onSuccess) { outcome.onSuccess(playerState); }
+                break; 
+            } 
+        } 
+    }
     if (chosenOutcome.effects) { for (const stat in chosenOutcome.effects) { if (playerState[stat] !== undefined) playerState[stat] += chosenOutcome.effects[stat]; } }
     
     if (chosenOutcome.onSuccess) { 
@@ -317,17 +391,34 @@ async function handleDecision(playerName, choice) {
     }
 
     if (chosenOutcome.clearFlags) { chosenOutcome.clearFlags.forEach(flag => playerState.flags.delete(flag)); }
-    
+    if (currentEvent.isUnique) { playerState.flags.set(currentEvent.id, true); }
+
     playerState.isAwaitingDecision = false;
     playerState.currentEventId = null;
     playerState.currentEventIndex++;
+    
+    // --- ***CHANGE***: Immediate Game Over check after any decision ---
+    if (playerState.treasury < 0) {
+        await playerState.save();
+        const bankruptcyReplies = await destroyKingdom(playerName, "Your last decision has bankrupted the kingdom!");
+        return replies.concat(bankruptcyReplies);
+    }
+    if (playerState.happiness <= 0) {
+        await playerState.save();
+        const revoltReplies = await destroyKingdom(playerName, "Your last decision has caused the people to revolt!");
+        return replies.concat(revoltReplies);
+    }
+    // --- End of new check ---
+
     await playerState.save();
 
     let statusChanges = [];
     const trackableStats = ['happiness', 'population', 'jailedPopulation', 'treasury', 'military'];
     trackableStats.forEach(stat => {
-        if (oldStats[stat] !== playerState[stat]) {
-            statusChanges.push(formatStatChange(stat, oldStats[stat], playerState[stat]));
+        const newValue = playerState[stat];
+        const oldValue = oldStats[stat];
+        if (oldValue !== newValue) {
+            statusChanges.push(formatStatChange(stat, oldValue, newValue));
         }
     });
 
@@ -350,7 +441,6 @@ async function handleSetTax(playerName, newRate) {
 }
 
 function formatStatChange(stat, oldValue, newValue) {
-    // --- *** BUG FIX: This function is now simple and correct. *** ---
     const symbols = { treasury: '💰', happiness: '😊', population: '👨‍👩‍👧‍👦', military: '💂', jailedPopulation: '⛓️' };
     return `${symbols[stat]} ${oldValue} ➞ ${newValue}`;
 }
